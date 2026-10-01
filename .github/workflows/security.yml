@@ -49,20 +49,3 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
-  deploy:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [check, codeql]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Start Cloudflare Workers Build for main
-        env:
-          CLOUDFLARE_DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
-        run: |
-          node --input-type=module <<'JS'
-          const response = await fetch(process.env.CLOUDFLARE_DEPLOY_HOOK, { method: 'POST' });
-          if (!response.ok) throw new Error(`Cloudflare rejected the build request: ${response.status}`);
-          const data = await response.json();
-          if (data.success === false) throw new Error('Cloudflare did not accept the build request');
-          console.log('Cloudflare build accepted. Check Workers Builds for deployment status.');
-          JS

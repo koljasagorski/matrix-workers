@@ -29,7 +29,7 @@ Cloudflare Workers Builds is connected to GitHub with:
 - Deploy command: `npm run deploy`
 - Node version: `22.22.3`
 
-The GitHub `CI` workflow invokes a Cloudflare Deploy Hook after its check and CodeQL jobs succeed on `main`. The hook URL is held in the GitHub repository secret `CLOUDFLARE_DEPLOY_HOOK`. It is not committed. Pushes trigger builds, including documentation changes. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub’s deploy job confirms the build request was accepted; the final build/deployment result is reported in Cloudflare Workers Builds. Rotate the hook in Cloudflare and update the repository secret together if necessary.
+The native GitHub integration triggers Cloudflare builds on pushes to `main`, including documentation changes. Events may take a few minutes to appear after initial setup. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub Actions independently runs checks and CodeQL; Cloudflare runs its own checks before deploying. No deploy hook or Cloudflare secret is needed in GitHub.
 
 To redeploy manually with authenticated Cloudflare CLI access:
 
