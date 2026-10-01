@@ -1,581 +1,120 @@
-# Deployment Guide
+# Deployment and operations
 
-Complete guide to deploying your own Matrix homeserver on Cloudflare Workers.
+## Current installation
 
-## Table of Contents
+| Setting | Value |
+| --- | --- |
+| Repository | `koljasagorski/matrix-workers` |
+| Production branch | `main` |
+| Worker | `matrix-workers` |
+| Domain / Matrix server name | `m.sgr.ski` |
+| D1 | `matrix-workers-db` |
+| R2 | `matrix-workers-media` |
+| KV | Six namespaces prefixed `matrix-workers-` |
+| Workflows | `matrix-workers-room-join`, `matrix-workers-push-notification` |
+| Registration | Closed by default; controlled through `/admin` |
 
-- [Deploy Button (Quick Start)](#deploy-button-quick-start)
-- [Manual Deployment](#manual-deployment)
-  - [Prerequisites](#prerequisites)
-  - [Step 1: Clone and Install](#step-1-clone-and-install)
-  - [Step 2: Create Cloudflare Resources](#step-2-create-cloudflare-resources)
-  - [Step 3: Configure wrangler.jsonc](#step-3-configure-wranglerjsonc)
-  - [Step 4: Run Database Migrations](#step-4-run-database-migrations)
-  - [Step 5: Deploy](#step-5-deploy)
-  - [Step 6: Configure Your Domain](#step-6-configure-your-domain)
-  - [Step 7: Verify Deployment](#step-7-verify-deployment)
-- [Optional Features](#optional-features)
-- [Troubleshooting](#troubleshooting)
+The Worker, resources and GitHub build connection were provisioned through Cloudflare MCP. `wrangler.jsonc` is the source of truth for bindings, domain, compatibility date and non-secret settings. Public `workers.dev` and version preview URLs are disabled.
 
----
+## Automatic deployments
 
-## Deploy Button (Quick Start)
+Cloudflare Workers Builds is connected to GitHub with:
 
-The fastest way to deploy is using the Deploy to Cloudflare button:
+- Repository: `koljasagorski/matrix-workers`
+- Branch: `main` only
+- Root directory: `/`
+- Build command: `npm run check`
+- Deploy command: `npm run deploy`
+- Node version: `22.22.3`
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
+Pushes trigger builds, including documentation changes. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub Actions also runs checks and CodeQL but is not the deployment mechanism.
 
-### What the Deploy Button Does
-
-When you click the button, Cloudflare will:
-
-1. **Fork the repository** to your GitHub/GitLab account
-2. **Provision resources automatically**:
-   - D1 database
-   - All KV namespaces (SESSIONS, DEVICE_KEYS, CACHE, etc.)
-   - R2 bucket for media storage
-   - Durable Objects
-   - Workflows
-3. **Deploy the Worker** to your Cloudflare account
-4. **Set up Workers Builds** for continuous deployment from your forked repo
-
-### After Using the Deploy Button
-
-You still need to complete these steps manually:
-
-#### 1. Update SERVER_NAME
-
-The `SERVER_NAME` environment variable must match your domain. Update it in your Cloudflare dashboard:
-
-1. Go to [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages)
-2. Select your deployed Worker
-3. Go to **Settings** → **Variables and Secrets**
-4. Edit `SERVER_NAME` to your domain (e.g., `matrix.yourdomain.com`)
-5. Click **Deploy** to apply changes
-
-**Important:** `SERVER_NAME` cannot be changed after users register. Choose carefully.
-
-#### 2. Run Database Migrations
-
-The D1 database is created but empty. You must run all migrations:
-
-1. Find your D1 database name in the Worker settings (under **D1 Database Bindings**)
-2. Run each migration (replace `YOUR_DB_NAME` with your actual database name):
+To redeploy manually with authenticated Cloudflare CLI access:
 
 ```bash
-# Clone your forked repository locally
-git clone https://github.com/YOUR_USERNAME/matrix-workers
-cd matrix-workers
-
-# Authenticate wrangler
-npx wrangler login
-
-# Run all migrations in order
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/schema.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/002_phase1_e2ee.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/003_account_management.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/004_reports_and_notices.sql
-# Note: Two migrations share the 005 prefix (both must be run)
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/005_server_config.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/005_idp_providers.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/006_query_optimization.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/007_secure_server_keys.sql
-npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/008_federation_transactions.sql
+npm ci
+npm run check
+npm run deploy
+npm run smoke -- https://m.sgr.ski
 ```
 
-#### 3. Configure Custom Domain
+The deployment runs pending database migrations first. Design future migrations to remain compatible with the currently deployed Worker during rollout. Worker rollbacks do not roll back D1 data.
 
-Your Worker is deployed at `*.workers.dev` but Matrix federation requires a proper domain:
+## Create the first administrator
 
-1. Go to your Worker in the dashboard
-2. Navigate to **Settings** → **Domains & Routes**
-3. Click **Add** → **Custom Domain**
-4. Enter your domain (e.g., `matrix.yourdomain.com`)
-5. Cloudflare automatically configures DNS if your domain is on Cloudflare
-
-#### 4. Verify Deployment
-
-Test your deployment:
+Public registration remains closed during bootstrap. Authenticate the CLI to the account owning this installation, then run:
 
 ```bash
-# Replace with your domain
-curl https://matrix.yourdomain.com/_matrix/client/versions
-
-# Check federation
-curl https://matrix.yourdomain.com/_matrix/federation/v1/version
+npm run admin:create -- admin --remote
 ```
 
-Run the [Federation Tester](https://federationtester.matrix.org) with your server name.
+The command inserts a new administrator, hashes a generated password using the server's PBKDF2 format, and saves credentials to `.local/admin-remote.json` with mode `0600`. It does not print the password or overwrite an existing account. Store the password in your password manager and remove the local credentials file when no longer needed.
 
-#### 5. Register Your First User
+Sign in at `https://m.sgr.ski/admin`, then create ordinary accounts there. To create a local test admin, use `--local` instead. The dashboard registration toggle controls both public user and guest registration.
+
+## Database migrations
+
+Use `wrangler d1 migrations apply`, not a loop that reruns SQL files:
 
 ```bash
-curl -X POST "https://matrix.yourdomain.com/_matrix/client/v3/register" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "admin",
-    "password": "your-secure-password",
-    "auth": {"type": "m.login.dummy"}
-  }'
+npm run db:migrate:local
+npm run db:migrate
 ```
 
----
+D1 tracks applied filenames in `d1_migrations`. The original `schema.sql` is now `001_initial_schema.sql` so a fresh database initializes before later migrations. Migration 016 rebuilds event FTS and keeps it current after message updates/redaction. Existing source data is retained.
 
-## Manual Deployment
+**For an older installation with manually applied SQL:** export/back up the database and reconcile the already-applied filenames before adopting the migration runner. Do not blindly replay the full chain: historical migrations include `ALTER TABLE` and table rebuilds. The installation documented here uses a fresh database and the migration ledger from its first deployment.
 
-For more control, deploy manually using the steps below.
-
-## Prerequisites
-
-### Required
-
-1. **Cloudflare Account** with Workers Paid plan ($5/month)
-   - Required for Durable Objects, which are essential for real-time sync
-   - Sign up at [cloudflare.com](https://cloudflare.com)
-
-2. **Node.js 18+**
-   ```bash
-   node --version  # Should be v18.0.0 or higher
-   ```
-
-3. **Wrangler CLI**
-   ```bash
-   npm install -g wrangler
-   wrangler --version
-   ```
-
-4. **Authenticate Wrangler**
-   ```bash
-   npx wrangler login
-   ```
-   This opens a browser to authenticate with your Cloudflare account.
-
-5. **A Domain** managed by Cloudflare (for federation to work)
-   - Matrix federation requires a proper domain name
-   - The domain's DNS must be managed by Cloudflare
-
----
-
-## Step 1: Clone and Install
+Before major database changes:
 
 ```bash
-git clone https://github.com/nkuntz1934/matrix-workers
-cd matrix-workers
-npm install
+npx wrangler d1 export DB --remote --output .local/matrix-backup.sql
 ```
 
----
+Create `.local` first if needed. Treat exports as private: they include account and message data. Recovery options are described in [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
 
-## Step 2: Create Cloudflare Resources
+## Deploy a separate fork
 
-Run these commands and **save the output** - you'll need the IDs for configuration.
-
-### 2.1 Get Your Account ID
+The checked-in account and resource IDs belong to this deployment. Provision a separate D1 database, six KV namespaces and an R2 bucket, then replace their IDs, `account_id`, Worker/workflow names, `SERVER_NAME` and custom domain in `wrangler.jsonc`. Keep binding names unchanged.
 
 ```bash
-npx wrangler whoami
-```
-
-Note your Account ID from the output.
-
-### 2.2 Create D1 Database
-
-```bash
-npx wrangler d1 create my-matrix-db
-```
-
-Output will include:
-```
-Created D1 database 'my-matrix-db'
-database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-**Save the `database_id`.**
-
-### 2.3 Create KV Namespaces
-
-Create all 6 required KV namespaces:
-
-```bash
+npx wrangler d1 create your-matrix-db
 npx wrangler kv namespace create SESSIONS
 npx wrangler kv namespace create DEVICE_KEYS
 npx wrangler kv namespace create CACHE
 npx wrangler kv namespace create CROSS_SIGNING_KEYS
 npx wrangler kv namespace create ACCOUNT_DATA
 npx wrangler kv namespace create ONE_TIME_KEYS
+npx wrangler r2 bucket create your-matrix-media
 ```
 
-Each command outputs an ID. **Save all 6 IDs.**
+After updating the config, run `npm run types`, `npm run check` and `npm run deploy`. Connect the new repository through [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/). The build credential needs permission for Worker deployments, D1 migrations and the configured bindings/custom domain.
 
-Example output:
-```
-Add the following to your wrangler configuration file:
-kv_namespaces = [
-  { binding = "SESSIONS", id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
-]
-```
+Set the Matrix server name before creating users or federated rooms; it is embedded in their IDs. Changing a hostname later is not an account migration.
 
-### 2.4 Create R2 Bucket
+## Optional services
+
+| Service | Additional configuration |
+| --- | --- |
+| LiveKit / MatrixRTC | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, secret `LIVEKIT_API_SECRET`; VPC `LIVEKIT_API` for room-management calls |
+| Cloudflare TURN | `TURN_KEY_ID` and secret `TURN_API_TOKEN` |
+| Cloudflare Calls | Secrets `CALLS_APP_ID`, `CALLS_APP_SECRET` |
+| Email verification | Compatible `EMAIL` binding, authorized sender and `EMAIL_FROM` |
+| Direct Apple push | Secrets `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_PRIVATE_KEY`, `APNS_ENVIRONMENT` |
+| External OIDC | Provider configuration and secret `OIDC_ENCRYPTION_KEY` |
+| Browser / Analytics / AI | Optional `BROWSER`, `ANALYTICS`, `AI` bindings |
+
+These services are not configured by the base deployment. Validate the relevant integration before enabling it; the repository contains prototype implementations. Add secrets with `npx wrangler secret put NAME` and never commit credentials. Rerun `npm run types` after binding changes.
+
+## Verification and troubleshooting
 
 ```bash
-npx wrangler r2 bucket create my-matrix-media
+npm run smoke -- https://m.sgr.ski
+npx wrangler tail matrix-workers
 ```
 
-**Save the bucket name** (you chose it, so just remember it).
+Health is a liveness check. The smoke test also exercises registration configuration and federation signing-key generation. Local integration checks during this refresh additionally exercised password login, admin settings, room creation, messaging, sync and logout/refresh rejection.
 
----
+Use `https://m.sgr.ski` as the homeserver in clients, and `https://m.sgr.ski/admin` for administration. The admin page is public HTML; its APIs require an authenticated administrator. There is no bundled Element frontend.
 
-## Step 3: Configure wrangler.jsonc
-
-Open `wrangler.jsonc` and replace all placeholder values with your actual IDs.
-
-### 3.1 Basic Configuration
-
-```jsonc
-{
-  "name": "my-matrix-server",           // Your worker name
-  "account_id": "YOUR_ACCOUNT_ID",      // From npx wrangler whoami
-
-  // ... rest of config
-}
-```
-
-### 3.2 D1 Database
-
-```jsonc
-"d1_databases": [
-  {
-    "binding": "DB",
-    "database_name": "my-matrix-db",           // Name you chose
-    "database_id": "YOUR_DATABASE_ID"          // From d1 create output
-  }
-]
-```
-
-### 3.3 KV Namespaces
-
-```jsonc
-"kv_namespaces": [
-  { "binding": "SESSIONS", "id": "YOUR_SESSIONS_KV_ID" },
-  { "binding": "DEVICE_KEYS", "id": "YOUR_DEVICE_KEYS_KV_ID" },
-  { "binding": "CACHE", "id": "YOUR_CACHE_KV_ID" },
-  { "binding": "CROSS_SIGNING_KEYS", "id": "YOUR_CROSS_SIGNING_KEYS_KV_ID" },
-  { "binding": "ACCOUNT_DATA", "id": "YOUR_ACCOUNT_DATA_KV_ID" },
-  { "binding": "ONE_TIME_KEYS", "id": "YOUR_ONE_TIME_KEYS_KV_ID" }
-]
-```
-
-### 3.4 R2 Bucket
-
-```jsonc
-"r2_buckets": [
-  {
-    "binding": "MEDIA",
-    "bucket_name": "my-matrix-media"    // Name you chose
-  }
-]
-```
-
-### 3.5 Environment Variables
-
-```jsonc
-"vars": {
-  "SERVER_NAME": "matrix.yourdomain.com",   // Your Matrix server domain
-  "SERVER_VERSION": "0.1.0"
-}
-```
-
-**Important:** `SERVER_NAME` must match the domain you'll use for Matrix. This cannot be changed after users register.
-
-### 3.6 Custom Domain (Optional but Recommended)
-
-```jsonc
-"routes": [
-  {
-    "pattern": "matrix.yourdomain.com",
-    "custom_domain": true
-  }
-]
-```
-
-### 3.7 Remove Optional Features (If Not Using)
-
-If you're not using LiveKit for video calls, remove or comment out:
-
-```jsonc
-// Remove these sections if not using LiveKit:
-"vpc_services": [ ... ],
-"vars": {
-  // Remove these:
-  "LIVEKIT_API_KEY": "...",
-  "LIVEKIT_URL": "..."
-}
-```
-
----
-
-## Step 4: Run Database Migrations
-
-Apply all migrations to your D1 database:
-
-```bash
-# Replace 'my-matrix-db' with your actual database name
-
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/schema.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/002_phase1_e2ee.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/003_account_management.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/004_reports_and_notices.sql
-# Note: Two migrations share the 005 prefix (both must be run)
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/005_server_config.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/005_idp_providers.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/006_query_optimization.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/007_secure_server_keys.sql
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/008_federation_transactions.sql
-```
-
-Each migration should complete with "success": true.
-
----
-
-## Step 5: Deploy
-
-```bash
-npm run deploy
-```
-
-Or directly:
-
-```bash
-npx wrangler deploy
-```
-
-The output will show your worker URL (e.g., `my-matrix-server.your-subdomain.workers.dev`).
-
----
-
-## Step 6: Configure Your Domain
-
-### Option A: Cloudflare Custom Domain (Recommended)
-
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. Navigate to **Workers & Pages** → Your Worker → **Settings** → **Domains & Routes**
-3. Click **Add** → **Custom Domain**
-4. Enter your domain (e.g., `matrix.yourdomain.com`)
-5. Cloudflare automatically configures DNS
-
-### Option B: Manual DNS Setup
-
-If using manual DNS, add these records:
-
-| Type | Name | Content | Proxy |
-|------|------|---------|-------|
-| CNAME | matrix | your-worker.workers.dev | Proxied |
-
-### Required: .well-known Endpoints
-
-Matrix clients and servers need `.well-known` endpoints. These are automatically served by the worker at:
-
-- `https://matrix.yourdomain.com/.well-known/matrix/server`
-- `https://matrix.yourdomain.com/.well-known/matrix/client`
-
-### Federation DNS (For Server-to-Server Communication)
-
-For full federation support, ensure your domain resolves correctly. The worker handles the `.well-known` responses automatically.
-
----
-
-## Step 7: Verify Deployment
-
-### 7.1 Check Basic Endpoints
-
-```bash
-# Replace with your domain
-export MATRIX_SERVER="https://matrix.yourdomain.com"
-
-# Check server is responding
-curl -s "$MATRIX_SERVER/_matrix/client/versions" | jq .
-
-# Check well-known endpoints
-curl -s "$MATRIX_SERVER/.well-known/matrix/server" | jq .
-curl -s "$MATRIX_SERVER/.well-known/matrix/client" | jq .
-
-# Check federation keys
-curl -s "$MATRIX_SERVER/_matrix/key/v2/server" | jq .
-
-# Check federation version
-curl -s "$MATRIX_SERVER/_matrix/federation/v1/version" | jq .
-```
-
-### 7.2 Run Federation Tester
-
-Visit the Matrix Federation Tester:
-
-```
-https://federationtester.matrix.org/api/report?server_name=matrix.yourdomain.com
-```
-
-Look for `"FederationOK": true` in the response.
-
-### 7.3 Register Your First User
-
-```bash
-curl -X POST "$MATRIX_SERVER/_matrix/client/v3/register" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "admin",
-    "password": "your-secure-password",
-    "auth": {
-      "type": "m.login.dummy"
-    }
-  }'
-```
-
-### 7.4 Test with Element
-
-1. Open [Element Web](https://app.element.io)
-2. Click **Sign In** → **Edit** homeserver
-3. Enter your server URL: `https://matrix.yourdomain.com`
-4. Sign in with your registered user
-
----
-
-## Optional Features
-
-### TURN Server (For Voice/Video Calls)
-
-Cloudflare provides TURN servers. To enable:
-
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com) → **Calls** → **TURN**
-2. Create a TURN key
-3. Add to `wrangler.jsonc`:
-   ```jsonc
-   "vars": {
-     "TURN_KEY_ID": "your-turn-key-id"
-   }
-   ```
-4. Set the secret:
-   ```bash
-   npx wrangler secret put TURN_API_TOKEN
-   # Paste your TURN API token when prompted
-   ```
-
-### LiveKit (For MatrixRTC Video Calls)
-
-If you have a LiveKit server:
-
-1. Add to `wrangler.jsonc`:
-   ```jsonc
-   "vars": {
-     "LIVEKIT_API_KEY": "your-api-key",
-     "LIVEKIT_URL": "wss://your-livekit-server.com"
-   }
-   ```
-2. Set the secret:
-   ```bash
-   npx wrangler secret put LIVEKIT_API_SECRET
-   ```
-
-### APNs Push Notifications (iOS)
-
-For direct Apple Push Notification support:
-
-```bash
-npx wrangler secret put APNS_KEY_ID      # From Apple Developer Portal
-npx wrangler secret put APNS_TEAM_ID     # Your Apple Team ID
-npx wrangler secret put APNS_PRIVATE_KEY # Contents of .p8 file
-```
-
-### OIDC Authentication
-
-For OpenID Connect login:
-
-```bash
-npx wrangler secret put OIDC_ENCRYPTION_KEY
-# Generate with: openssl rand -base64 32
-```
-
----
-
-## Troubleshooting
-
-### "Workers Paid plan required"
-
-Durable Objects require the Workers Paid plan ($5/month). Upgrade at:
-Cloudflare Dashboard → Workers & Pages → Plans
-
-### "Database not found"
-
-Ensure you've run all migrations and the database name in `wrangler.jsonc` matches what you created.
-
-### Federation Test Fails
-
-1. Verify your domain's DNS is managed by Cloudflare
-2. Check `.well-known/matrix/server` returns correct content
-3. Ensure the worker is deployed and responding
-4. Check the signing key is generated (first request auto-generates it)
-
-### "M_UNKNOWN" Errors
-
-Check Cloudflare Workers logs:
-```bash
-npx wrangler tail
-```
-
-### Registration Disabled
-
-Registration is enabled by default. If you've disabled it and need to create an admin:
-
-```bash
-# Connect to D1 directly
-npx wrangler d1 execute my-matrix-db --remote --command "SELECT * FROM users LIMIT 5"
-```
-
-### Rate Limited
-
-The server has rate limiting. Default limits:
-- Login: 10 requests/minute
-- Register: 5 requests/minute
-- General API: 100 requests/minute
-
----
-
-## Updating
-
-To update your deployment:
-
-```bash
-git pull
-npm install
-npm run deploy
-```
-
-If there are new migrations, run them before deploying:
-
-```bash
-npx wrangler d1 execute my-matrix-db --remote --file=migrations/NEW_MIGRATION.sql
-```
-
----
-
-## Architecture Overview
-
-Your deployed Matrix server uses:
-
-| Component | Cloudflare Service | Purpose |
-|-----------|-------------------|---------|
-| API & Routing | Workers | HTTP request handling |
-| Database | D1 | Users, rooms, events, messages |
-| Sessions | KV | Access tokens, fast lookups |
-| E2EE Keys | KV | Device keys, cross-signing |
-| Media | R2 | Images, files, avatars |
-| Real-time Sync | Durable Objects | Live updates, typing indicators |
-| Federation | Durable Objects | Server-to-server communication |
-| Background Jobs | Workflows | Room joins, push notifications |
-
----
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/nkuntz1934/matrix-workers/issues)
-- **Matrix Spec**: [spec.matrix.org](https://spec.matrix.org)
-- **Cloudflare Docs**: [developers.cloudflare.com](https://developers.cloudflare.com)
+For federation diagnostics, use the [Matrix Federation Tester](https://federationtester.matrix.org/#m.sgr.ski). Passing its connectivity tests does not establish full Matrix protocol conformance.

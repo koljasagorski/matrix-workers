@@ -109,6 +109,7 @@ export async function createLiveKitRoom(
   env: Env,
   roomName: string
 ): Promise<{ room: { name: string; sid: string } } | null> {
+  if (!env.LIVEKIT_API) return null;
   try {
     // LiveKit uses Twirp protocol
     const response = await env.LIVEKIT_API.fetch(
@@ -136,6 +137,7 @@ export async function createLiveKitRoom(
 
 // List rooms via LiveKit API
 export async function listLiveKitRooms(env: Env): Promise<{ rooms: any[] } | null> {
+  if (!env.LIVEKIT_API) return null;
   try {
     const response = await env.LIVEKIT_API.fetch(
       'http://localhost:7880/twirp/livekit.RoomService/ListRooms',

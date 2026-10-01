@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. The live instance runs at `m.easydemo.org`.
+This project is an experimental Matrix homeserver running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. The live instance runs at `m.sgr.ski`.
 
 ## Development Commands
 
@@ -12,11 +12,13 @@ Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Worke
 npm run dev              # Local dev server (wrangler dev)
 npm run deploy           # Deploy to Cloudflare
 npm run typecheck        # TypeScript type checking (tsc --noEmit)
-npm run lint             # ESLint on src/
+npm run check            # Types, regression tests, audit and dry-run build
 npm run test             # Vitest
 npm run db:migrate       # Run D1 migrations (remote)
 npm run db:migrate:local # Run D1 migrations (local)
 ```
+
+Production deploys are triggered by pushes to `main` through Cloudflare Workers Builds. Public registration is closed by default; create the initial admin with `npm run admin:create -- admin --remote`. Credentials in `.local/` must never be committed.
 
 ## Architecture
 
@@ -33,10 +35,10 @@ npm run db:migrate:local # Run D1 migrations (local)
 - `src/types/` — `env.ts` (Cloudflare bindings), `matrix.ts` (PDU/event types).
 - `src/utils/` — `crypto.ts` (hashing/signing), `ids.ts` (Matrix ID generation), `errors.ts` (MatrixApiError + Errors factory).
 - `src/admin/dashboard.ts` — Embedded admin web UI at `/admin`.
-- `migrations/` — D1 schema files (schema.sql + numbered migrations 002–011).
+- `migrations/` — D1 schema files (ordered migrations 001–016, tracked by D1).
 
 **Storage bindings (defined in `wrangler.jsonc`):**
-- D1 `tuwunel-db` — Relational data (users, rooms, events, memberships, etc.)
+- D1 `matrix-workers-db` — Relational data (users, rooms, events, memberships, etc.)
 - KV namespaces: `SESSIONS`, `DEVICE_KEYS`, `ONE_TIME_KEYS`, `CROSS_SIGNING_KEYS`, `CACHE`, `ACCOUNT_DATA`
 - R2 `MEDIA` — Media file storage
 
@@ -49,7 +51,7 @@ npm run db:migrate:local # Run D1 migrations (local)
 - Real-time: Hibernatable WebSockets via RoomDurableObject, long-polling `/sync`, Sliding Sync (MSC3575/MSC4186) for Element X.
 - Passwords hashed with PBKDF2-SHA256 (100,000 iterations).
 
-**TypeScript config:** Strict mode, ES2022 target, `@/*` path alias maps to `src/*`, `@cloudflare/workers-types`.
+**TypeScript config:** Strict mode, ES2022 target, `@/*` path alias maps to `src/*`, generated `worker-configuration.d.ts`.
 
 ## Git Commit Rules
 

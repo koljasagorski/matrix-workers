@@ -57,18 +57,9 @@ export async function validateAccessToken(
 export function requireAuth() {
   return createMiddleware<AppEnv>(async (c, next) => {
     const token = extractAccessToken(c.req.raw);
-    const path = new URL(c.req.url).pathname;
-
     if (!token) {
-      // Log full headers for debugging missing token
-      const authHeader = c.req.raw.headers.get('Authorization');
-      console.log(`[AUTH] Missing token for ${path}. Authorization header: ${authHeader || 'NONE'}`);
       return Errors.missingToken().toResponse();
     }
-
-    // Log token prefix for debugging (first 8 chars only for security)
-    const tokenPrefix = token.substring(0, 8);
-    console.log(`[AUTH] Validating token ${tokenPrefix}... for ${path}`);
 
     let auth = await validateAccessToken(c.env.DB, token);
 
@@ -94,11 +85,9 @@ export function requireAuth() {
     }
 
     if (!auth) {
-      console.log(`[AUTH] Token ${tokenPrefix}... is INVALID for ${path}. Token length: ${token.length}`);
       return Errors.unknownToken().toResponse();
     }
 
-    console.log(`[AUTH] Token ${tokenPrefix}... valid for user ${auth.userId}`);
 
 
     // Store auth context

@@ -40,7 +40,7 @@ interface ServerConfig {
 
 const STATS_CACHE_TTL = 30 * 1000; // 30 seconds cache for stats
 const DEFAULT_CONFIG: ServerConfig = {
-  registration_enabled: true,
+  registration_enabled: false,
   updated_at: 0,
 };
 

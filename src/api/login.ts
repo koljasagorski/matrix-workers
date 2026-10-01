@@ -36,9 +36,6 @@ app.get('/_matrix/client/v3/login', (c) => {
       {
         type: 'm.login.token',
       },
-      {
-        type: 'm.login.dummy',
-      },
     ],
   });
 });
@@ -114,23 +111,6 @@ app.post('/_matrix/client/v3/login', async (c) => {
     if (!valid) {
       return Errors.forbidden('Invalid username or password').toResponse();
     }
-  } else if (type === 'm.login.dummy') {
-    // m.login.dummy is for UIA flows - requires identifier but no password verification
-    // Per Matrix spec, this "does nothing and never fails" but still needs a user identifier
-    if (!identifier) {
-      return Errors.missingParam('identifier').toResponse();
-    }
-
-    // Parse identifier
-    if (identifier.type === 'm.id.user') {
-      if (identifier.user.startsWith('@')) {
-        userId = identifier.user;
-      } else {
-        userId = formatUserId(identifier.user, c.env.SERVER_NAME);
-      }
-    } else {
-      return Errors.unrecognized('Unknown identifier type').toResponse();
-    }
   } else {
     return Errors.unrecognized('Unknown login type').toResponse();
   }
@@ -155,7 +135,7 @@ app.post('/_matrix/client/v3/login', async (c) => {
   const tokenHash = await hashToken(accessToken);
   const tokenId = await generateOpaqueId(16);
 
-  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
+  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
 
   // Generate refresh token and store in KV with auto-expiration
   const refreshToken = await generateRefreshToken();
@@ -237,20 +217,33 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
 
   const { userId, deviceId, accessTokenId } = tokenData;
 
+  // Logout, device deletion and account deactivation must also revoke refresh.
+  const session = await c.env.DB.prepare(
+    `SELECT t.token_id FROM access_tokens t JOIN users u ON u.user_id = t.user_id
+     WHERE t.token_id = ? AND t.user_id = ? AND u.is_deactivated = 0`
+  ).bind(accessTokenId, userId).first();
+  if (!session) {
+    await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);
+    return Errors.unknownToken('Session has been revoked').toResponse();
+  }
+
   // Delete old refresh token from KV (token rotation - single use)
   await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);
 
   // Delete old access token from D1
-  await c.env.DB.prepare(
-    `DELETE FROM access_tokens WHERE token_id = ?`
-  ).bind(accessTokenId).run();
+  const consumed = await c.env.DB.prepare(
+    `DELETE FROM access_tokens WHERE token_id = ? RETURNING token_id`
+  ).bind(accessTokenId).first();
+  if (!consumed) {
+    return Errors.unknownToken('Refresh token has already been used').toResponse();
+  }
 
   // Generate new access token
   const newAccessToken = await generateAccessToken();
   const newTokenHash = await hashToken(newAccessToken);
   const newTokenId = await generateOpaqueId(16);
 
-  await createAccessToken(c.env.DB, newTokenId, newTokenHash, userId, deviceId);
+  await createAccessToken(c.env.DB, newTokenId, newTokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
 
   // Generate new refresh token
   const newRefreshToken = await generateRefreshToken();
@@ -279,6 +272,20 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
 });
 
 // GET /_matrix/client/v3/register/available - Check if username is available
+// Use the same durable configuration as the admin dashboard, including guests.
+app.use('/_matrix/client/v3/register*', async (c, next) => {
+  const admin = c.env.ADMIN.get(c.env.ADMIN.idFromName('global'));
+  const response = await admin.fetch('https://internal/config');
+  if (!response.ok) {
+    return Errors.forbidden('Registration is unavailable').toResponse();
+  }
+  const config = await response.json() as { registration_enabled?: boolean };
+  if (config.registration_enabled !== true) {
+    return Errors.forbidden('Registration is disabled').toResponse();
+  }
+  return next();
+});
+
 app.get('/_matrix/client/v3/register/available', async (c) => {
   const username = c.req.query('username');
 
@@ -382,7 +389,7 @@ app.post('/_matrix/client/v3/register', async (c) => {
   const tokenHash = await hashToken(accessToken);
   const tokenId = await generateOpaqueId(16);
 
-  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
+  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
 
   // Generate refresh token and store in KV with auto-expiration
   const refreshToken = await generateRefreshToken();

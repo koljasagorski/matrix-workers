@@ -3,7 +3,6 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
 import type { AppEnv } from './types';
 
 // Import API routes
@@ -66,11 +65,13 @@ app.use('*', cors({
 }));
 
 // Global middleware
-app.use('*', logger());
 app.use('*', analyticsMiddleware());
 
 // Rate limiting for Matrix API endpoints
 app.use('/_matrix/*', rateLimitMiddleware);
+
+// Direct browser visits lead to the existing admin interface.
+app.get('/', (c) => c.redirect('/admin'));
 
 // Health check
 app.get('/health', (c) => c.json({ status: 'ok', server: 'matrix-worker' }));

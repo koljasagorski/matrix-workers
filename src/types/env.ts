@@ -1,30 +1,6 @@
 // Cloudflare Workers Environment Types
 
-export interface Env {
-  // D1 Database
-  DB: D1Database;
-
-  // KV Namespaces
-  SESSIONS: KVNamespace;
-  DEVICE_KEYS: KVNamespace;
-  CACHE: KVNamespace;
-  CROSS_SIGNING_KEYS: KVNamespace;
-  ACCOUNT_DATA: KVNamespace;
-  ONE_TIME_KEYS: KVNamespace;
-
-  // R2 Bucket
-  MEDIA: R2Bucket;
-
-  // Durable Objects
-  ROOMS: DurableObjectNamespace;
-  SYNC: DurableObjectNamespace;
-  FEDERATION: DurableObjectNamespace;
-  ADMIN: DurableObjectNamespace;
-  USER_KEYS: DurableObjectNamespace;
-  PUSH: DurableObjectNamespace;
-  RATE_LIMIT: DurableObjectNamespace;
-
-  // Environment variables
+export interface Env extends Omit<CloudflareBindings, 'SERVER_NAME' | 'SERVER_VERSION'> {
   SERVER_NAME: string;
   SERVER_VERSION: string;
 
@@ -49,11 +25,8 @@ export interface Env {
   CALLS_APP_ID?: string;      // Cloudflare Calls App ID
   CALLS_APP_SECRET?: string;  // Cloudflare Calls App Secret
 
-  // Durable Object for call signaling
-  CALL_ROOMS?: DurableObjectNamespace;
-
   // Workers VPC Service binding for LiveKit
-  LIVEKIT_API: Fetcher;
+  LIVEKIT_API?: Fetcher;
 
   // LiveKit Configuration for MatrixRTC
   LIVEKIT_API_KEY?: string;      // LiveKit API Key (e.g., "devkey")
@@ -65,10 +38,6 @@ export interface Env {
   APNS_TEAM_ID?: string;         // Apple Developer Team ID
   APNS_PRIVATE_KEY?: string;     // Contents of the .p8 private key file
   APNS_ENVIRONMENT?: string;     // "production" or "sandbox" (default: production)
-
-  // Cloudflare Workflows for durable multi-step operations
-  ROOM_JOIN_WORKFLOW: Workflow;
-  PUSH_NOTIFICATION_WORKFLOW: Workflow;
 
   // Email Service Configuration (Cloudflare Email Service)
   EMAIL?: SendEmail;         // Cloudflare Email Service binding

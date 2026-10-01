@@ -1,331 +1,107 @@
-# Matrix Homeserver on Cloudflare Workers
+# Matrix on Cloudflare Workers
 
-[![Security](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml)
+[![CI](https://github.com/koljasagorski/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/koljasagorski/matrix-workers/actions/workflows/security.yml)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
+A self-hosted Matrix homeserver implemented in TypeScript and Hono, running on Cloudflare Workers with D1, KV, R2, Durable Objects and Workflows.
 
-This is a proof of concept Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. This was built to prove E2EE utilizing Matrix protocols over Element X on the Cloudflare Workers Platform. It is meant to serve as an example prototype and not endorsed as ready for production at this point.
+**Homeserver:** [m.sgr.ski](https://m.sgr.ski) · **Administration:** [m.sgr.ski/admin](https://m.sgr.ski/admin) · **Status:** [health](https://m.sgr.ski/health)
 
-I was assisted by Claude Code Opus 4.5 for this implementation to speed up showing that you could message over Cloudflare Workers utilizing the Element Web and Element X App. Feel free to submit issues, fork the project to make it your own, or continue to build on this example!
+This is an experimental implementation, derived from [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers). It is not Synapse or the Rust Tuwunel server. Implemented endpoints are not evidence of complete Matrix specification compliance or an independent security audit. Use it with that limitation in mind.
 
-## Live Demo
+## Connect
 
-A live instance is running at `m.easydemo.org`. You can verify federation compatibility using the [Matrix Federation Tester](https://federationtester.matrix.org/#m.easydemo.org) or view the [full JSON report](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org).
+In Element Web, Element X or another Matrix client, choose a custom homeserver and enter:
 
-## Quick Start
-
-### One-Click Deploy
-
-The fastest way to deploy is using the Deploy to Cloudflare button at the top of this README. After clicking:
-
-1. Cloudflare provisions all resources automatically
-2. You need to update `SERVER_NAME` to your domain
-3. Run database migrations
-4. Configure your custom domain
-
-**See [DEPLOYMENT.md](./DEPLOYMENT.md) for complete instructions.**
-
-### Manual Deploy
-
-```bash
-# Clone and install
-git clone https://github.com/SilentHeroes/matrix-worker
-cd matrix-worker
-npm install
-
-# Create resources (save IDs from output)
-npx wrangler d1 create my-matrix-db
-npx wrangler kv namespace create SESSIONS
-npx wrangler kv namespace create DEVICE_KEYS
-npx wrangler kv namespace create ONE_TIME_KEYS
-npx wrangler kv namespace create CROSS_SIGNING_KEYS
-npx wrangler kv namespace create CACHE
-npx wrangler kv namespace create ACCOUNT_DATA
-npx wrangler r2 bucket create my-matrix-media
-
-# Update wrangler.jsonc with your resource IDs and SERVER_NAME
-# Then run migrations and deploy (see DEPLOYMENT.md for details)
+```text
+https://m.sgr.ski
 ```
 
-**See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.**
+Accounts have IDs such as `@alice:m.sgr.ski`. Public and guest registration are disabled by default. An administrator creates accounts in the admin dashboard. The root URL redirects to that dashboard; this repository does not bundle a chat client.
 
-### Email Verification (Optional)
+The server publishes client and federation discovery at `/.well-known/matrix/client` and `/.well-known/matrix/server`. Federation uses HTTPS on port 443.
 
-For 3PID email verification support, configure [Cloudflare Email Service](https://developers.cloudflare.com/email-service/) (currently in closed beta):
+## What is included
 
-1. In the Cloudflare dashboard, go to **Compute & AI > Email Service > Email Sending**
-2. Select **Onboard Domain** and choose your domain (must use Cloudflare DNS)
-3. Wait for SPF/DKIM DNS records to propagate (typically 5–15 minutes)
-4. Set the from address secret:
+| Area | Implementation |
+| --- | --- |
+| Accounts | Password login, devices, access/refresh tokens, profiles, admin dashboard |
+| Messaging | Rooms, membership, messages, classic sync and sliding sync |
+| Encryption support | Device keys, one-time keys, cross-signing and encrypted key backups; encryption happens in clients |
+| Federation | Server discovery, signing keys and server-to-server endpoints |
+| Media and search | R2 uploads/downloads and D1 FTS5 search |
+| Optional integrations | External OIDC, application services, push delivery, LiveKit/TURN and email verification |
+
+Voice/video, email sending, direct APNs delivery, AI, analytics and browser rendering require additional bindings or credentials. They are **not enabled** in this deployment. See [deployment and operations](DEPLOYMENT.md).
+
+## Local development
+
+Use Node.js 22.12 or newer (the project and CI use Node 22).
 
 ```bash
-npx wrangler secret put EMAIL_FROM
-# Example: noreply@m.easydemo.org
+git clone https://github.com/koljasagorski/matrix-workers.git
+cd matrix-workers
+npm ci
+npm run db:migrate:local
+npm run admin:create -- admin --local
+npm run dev
 ```
 
-## Spec Compliance
+Open `http://localhost:8787/admin`. The admin creation command saves the generated password in `.local/admin-local.json` with restrictive file permissions. That directory is ignored by Git. For a local client, enter `http://localhost:8787` explicitly: the committed discovery configuration names the production domain.
 
-**[Matrix Specification v1.17](https://spec.matrix.org/v1.17/) Compliance**
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Local Workers runtime with local storage |
+| `npm run check` | Type check, regression tests, dependency audit and deployment dry run |
+| `npm test` | Authentication, token lifetime, migrations and search regression tests |
+| `npm run types` | Regenerate Cloudflare binding/runtime types after config changes |
+| `npm run db:migrate:local` | Apply pending migrations locally |
+| `npm run db:migrate` | Apply pending migrations to the production D1 database |
+| `npm run deploy` | Apply production migrations, then deploy the Worker |
+| `npm run smoke -- https://m.sgr.ski` | Check discovery, health, login flows, closed registration and server keys |
+| `npm run admin:create -- admin --remote` | Create an initial admin using authenticated Cloudflare CLI access |
 
-| Spec Section | Implementation | Spec Reference |
-|--------------|----------------|----------------|
-| [Client-Server API](https://spec.matrix.org/v1.17/client-server-api/) | [`src/api/`](src/api/) | Auth, sync, rooms, messaging, profiles |
-| [Server-Server API](https://spec.matrix.org/v1.17/server-server-api/) | [`src/api/federation.ts`](src/api/federation.ts) | Federation, PDUs, EDUs, key exchange |
-| [Room Versions](https://spec.matrix.org/v1.17/rooms/) | [`src/services/events.ts`](src/services/events.ts) | v1-v12, event auth, state resolution |
-| [End-to-End Encryption](https://spec.matrix.org/v1.17/client-server-api/#end-to-end-encryption) | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/key-backups.ts`](src/api/key-backups.ts) | Device keys, OTKs, cross-signing, key backup |
-| [OAuth 2.0 API](https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api) | [`src/api/oauth.ts`](src/api/oauth.ts), [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | MSC3861, MSC2965, MSC2967, MSC4191 |
-| [Discovery](https://spec.matrix.org/v1.17/client-server-api/#server-discovery) | [`src/index.ts`](src/index.ts) | `.well-known/matrix/client`, `/versions` |
-| [Content Repository](https://spec.matrix.org/v1.17/client-server-api/#content-repository) | [`src/api/media.ts`](src/api/media.ts) | Upload, download, thumbnails, MSC3916 |
-| [Push Notifications](https://spec.matrix.org/v1.17/client-server-api/#push-notifications) | [`src/api/push.ts`](src/api/push.ts), [`src/workflows/`](src/workflows/) | Push rules, pushers |
-| [Presence](https://spec.matrix.org/v1.17/client-server-api/#presence) | [`src/api/presence.ts`](src/api/presence.ts) | Online/offline status |
-| [Typing Notifications](https://spec.matrix.org/v1.17/client-server-api/#typing-notifications) | [`src/api/typing.ts`](src/api/typing.ts) | Typing indicators |
-| [Receipts](https://spec.matrix.org/v1.17/client-server-api/#receipts) | [`src/api/receipts.ts`](src/api/receipts.ts) | Read receipts |
-| [Spaces](https://spec.matrix.org/v1.17/client-server-api/#spaces) | [`src/api/spaces.ts`](src/api/spaces.ts) | Space hierarchy |
-| [VoIP](https://spec.matrix.org/v1.17/client-server-api/#voice-over-ip) | [`src/api/voip.ts`](src/api/voip.ts), [`src/api/calls.ts`](src/api/calls.ts) | TURN servers, MatrixRTC |
-| [Account Data](https://spec.matrix.org/v1.17/client-server-api/#client-config) | [`src/api/account-data.ts`](src/api/account-data.ts) | User/room account data |
-| [3PID Management](https://spec.matrix.org/v1.17/client-server-api/#adding-account-administrative-contact-information) | [`src/api/account.ts`](src/api/account.ts) | Email verification, 3PID binding |
+## Deployment from GitHub
 
-**Unstable Features (MSCs)**
+Cloudflare Workers Builds is connected to this repository's `main` branch:
 
-| Feature | Implementation | MSC |
-|---------|----------------|-----|
-| Sliding Sync | [`src/api/sliding-sync.ts`](src/api/sliding-sync.ts) | [MSC3575](https://github.com/matrix-org/matrix-spec-proposals/pull/3575), [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) |
-| Authenticated Media | [`src/api/media.ts`](src/api/media.ts) | [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) |
-| Cross-signing Reset | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/oauth.ts`](src/api/oauth.ts) | [MSC4312](https://github.com/matrix-org/matrix-spec-proposals/pull/4312) |
-| Account Management | [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | [MSC4191](https://github.com/matrix-org/matrix-spec-proposals/pull/4191) |
+1. A push to `main` starts a Cloudflare build.
+2. Dependencies install from `package-lock.json` using `npm ci`.
+3. `npm run check` must pass.
+4. `npm run deploy` applies pending D1 migrations and deploys to `m.sgr.ski`.
 
-## Features
+GitHub Actions independently checks changes and runs CodeQL. Dependabot proposes weekly npm and GitHub Actions updates; updates are reviewed and merged before they reach production. Pull requests do not deploy to production.
 
-- **Full E2EE Support**: Device keys, cross-signing, key backup, one-time keys, federation key queries
-- **Token Refresh**: Secure token rotation with single-use refresh tokens (KV-backed with auto-expiry)
-- **Sliding Sync**: MSC3575 and MSC4186 (Simplified Sliding Sync for Element X)
-- **Real-time**: Sync coordination via Durable Objects, presence with KV caching
-- **Federation**: Complete server-to-server communication including E2EE, knock protocol, media, and directory
-- **Media Storage**: R2-backed media with thumbnail generation and authenticated media (MSC3916)
-- **Push Notifications**: APNs support (iOS direct push)
-- **Video Calling**: MatrixRTC with LiveKit and Cloudflare Calls SFU integration
-- **Knock Protocol**: Support for knock-to-join rooms via federation
-- **Room Versions**: Full support for room versions 1-12
-- **Admin Dashboard**: Full-featured web UI with charts, user management, keyboard shortcuts
-- **Synapse API Compatibility**: Standard `/_synapse/admin/*` endpoints for tool compatibility
+The Cloudflare build integration holds its deployment credentials. No Cloudflare API token belongs in the repository. Resource IDs and the domain in `wrangler.jsonc` are specific to this installation; forks need their own resources.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Cloudflare Edge Network                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   Workers   │  │  Durable    │  │     D1      │  │         R2          │ │
-│  │   (Hono)    │──│  Objects    │──│  (SQLite)   │  │   (Object Storage)  │ │
-│  │             │  │             │  │             │  │                     │ │
-│  │ • Routing   │  │ • Room DO   │  │ • users     │  │ • Media files       │ │
-│  │ • Auth      │  │ • Sync DO   │  │ • rooms     │  │ • Thumbnails        │ │
-│  │ • API       │  │ • Fed DO    │  │ • events    │  │ • Avatars           │ │
-│  │ • Rate Lim  │  │ • Keys DO   │  │ • keys      │  │                     │ │
-│  └─────────────┘  │ • Push DO   │  │ • tokens    │  └─────────────────────┘ │
-│         │         │ • Admin DO  │  └─────────────┘            │             │
-│         │         │ • Call DO   │                             │             │
-│         │         │ • Rate DO   │                             │             │
-│         │         └─────────────┘         │                   │             │
-│  ┌──────┴─────────────────────────────────┴───────────────────┴───────────┐ │
-│  │                          KV Namespaces                                 │ │
-│  │  SESSIONS · DEVICE_KEYS · CACHE · ONE_TIME_KEYS · CROSS_SIGNING_KEYS   │ │
-│  │  ACCOUNT_DATA                                                          │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                     Workflows (Durable Execution)                      │ │
-│  │  RoomJoinWorkflow · PushNotificationWorkflow                           │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+  Client[Matrix clients] --> Worker[Hono / Cloudflare Worker]
+  Peers[Other homeservers] <--> Worker
+  Worker --> D1[(D1: users, rooms, events)]
+  Worker --> KV[(KV: sessions and caches)]
+  Worker --> R2[(R2: media)]
+  Worker --> DO[Durable Objects: sync and coordination]
+  Worker --> Workflows[Workflows: room joins and push]
+  GitHub[GitHub main] --> Builds[Cloudflare Workers Builds]
+  Builds --> Worker
 ```
 
-## API Coverage
+- `src/api/`: Matrix, federation and administration endpoints.
+- `src/services/`: persistence, event authentication, state resolution and integrations.
+- `src/durable-objects/`: room, sync, federation, admin, key, push and rate-limit coordination.
+- `src/workflows/`: durable background operations; two are bound in the deployed configuration.
+- `migrations/`: ordered SQL migrations tracked by D1.
+- `tests/`: regression tests for the maintenance fixes.
+- `worker-configuration.d.ts`: generated Cloudflare types.
 
-### Client-Server API
+## Maintenance changes
 
-| Category | Endpoints | Status |
-|----------|-----------|--------|
-| Authentication | `/login`, `/register`, `/logout`, `/refresh`, `/auth_metadata`, `/login/get_token` | ✅ |
-| Sync | `/sync`, Sliding Sync (MSC3575/MSC4186), filter persistence & application | ✅ |
-| Rooms | Create, join, leave, invite, kick, ban, knock, upgrade, summary | ✅ |
-| Messaging | Send, redact, edit, reply | ✅ |
-| State | Room state, power levels | ✅ |
-| E2EE | Device keys, OTKs, cross-signing, key backup | ✅ |
-| To-Device | Encrypted message relay | ✅ |
-| Push | Push rules, pushers (APNs/FCM) | ✅ |
-| Media | Upload, download, thumbnails (MSC3916 auth) | ✅ |
-| Profile | Display name, avatar, custom profile keys | ✅ |
-| Presence | Online/offline status with KV caching | ✅ |
-| Typing | Typing indicators | ✅ |
-| Receipts | Read receipts | ✅ |
-| Account Data | User settings, room tags | ✅ |
-| Directory | Room directory, aliases | ✅ |
-| Discovery | `.well-known/matrix/*` (client, server, support) | ✅ |
-| Reporting | Report events, rooms, users | ✅ |
-| Admin | User session info (`/admin/whois`), full admin API | ✅ |
-| 3PID | Email verification, 3PID management | ✅ |
-| Timestamps | `timestamp_to_event` for event lookup | ✅ |
+The October 2026 refresh updates Hono, Wrangler, TypeScript and Vitest, removes unused UUID packages, and replaces manually duplicated platform types with generated types. It also closes a passwordless login path, enforces the admin registration setting, checks token expiration/deactivated users, rejects refresh after logout, removes authentication-token debug logging and repairs the event search index.
 
-### Server-Server (Federation) API
-
-| Category | Endpoint | Purpose | Status |
-|----------|----------|---------|--------|
-| **Discovery** | `GET /_matrix/federation/v1/version` | Server version info | ✅ |
-| **Keys** | `GET /_matrix/key/v2/server` | Server signing keys | ✅ |
-| | `GET /_matrix/key/v2/server/{keyId}` | Specific signing key | ✅ |
-| | `POST /_matrix/key/v2/query` | Batch key query | ✅ |
-| | `GET /_matrix/key/v2/query/{serverName}` | Notary key query | ✅ |
-| | `GET /_matrix/key/v2/query/{serverName}/{keyId}` | Specific notary key | ✅ |
-| **E2EE** | `POST /_matrix/federation/v1/user/keys/query` | Query device keys | ✅ |
-| | `POST /_matrix/federation/v1/user/keys/claim` | Claim one-time keys | ✅ |
-| | `GET /_matrix/federation/v1/user/devices/{userId}` | Get user devices | ✅ |
-| **Events** | `PUT /_matrix/federation/v1/send/{txnId}` | Receive PDUs/EDUs | ✅ |
-| | `GET /_matrix/federation/v1/event/{eventId}` | Fetch single event | ✅ |
-| | `GET /_matrix/federation/v1/state/{roomId}` | Get room state | ✅ |
-| | `GET /_matrix/federation/v1/state_ids/{roomId}` | Get state event IDs | ✅ |
-| | `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}` | Get auth chain | ✅ |
-| | `GET /_matrix/federation/v1/backfill/{roomId}` | Fetch historical events | ✅ |
-| | `POST /_matrix/federation/v1/get_missing_events/{roomId}` | Fill event gaps | ✅ |
-| | `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` | Find event by timestamp | ✅ |
-| **Joining** | `GET /_matrix/federation/v1/make_join/{roomId}/{userId}` | Prepare join | ✅ |
-| | `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}` | Complete join (v1) | ✅ |
-| | `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}` | Complete join (v2) | ✅ |
-| **Leaving** | `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}` | Prepare leave | ✅ |
-| | `PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}` | Complete leave (v1) | ✅ |
-| | `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}` | Complete leave (v2) | ✅ |
-| **Knocking** | `GET /_matrix/federation/v1/make_knock/{roomId}/{userId}` | Prepare knock | ✅ |
-| | `PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}` | Complete knock | ✅ |
-| **Inviting** | `PUT /_matrix/federation/v1/invite/{roomId}/{eventId}` | Receive invite (v1) | ✅ |
-| | `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}` | Receive invite (v2) | ✅ |
-| **Media** | `GET /_matrix/federation/v1/media/download/{mediaId}` | Download media | ✅ |
-| | `GET /_matrix/federation/v1/media/thumbnail/{mediaId}` | Get thumbnail | ✅ |
-| **Directory** | `GET /_matrix/federation/v1/query/directory` | Resolve room alias | ✅ |
-| | `GET /_matrix/federation/v1/query/profile` | Query user profile | ✅ |
-| | `GET /_matrix/federation/v1/publicRooms` | List public rooms | ✅ |
-| | `POST /_matrix/federation/v1/publicRooms` | Search public rooms | ✅ |
-| **Spaces** | `GET /_matrix/federation/v1/hierarchy/{roomId}` | Get space hierarchy | ✅ |
-| **OpenID** | `GET /_matrix/federation/v1/openid/userinfo` | Validate OpenID token | ✅ |
-
-### Matrix v1.17 Compliance Additions
-
-The following endpoints were added to achieve full Matrix Specification v1.17 compliance:
-
-| Category | Endpoint | Purpose |
-|----------|----------|---------|
-| **Room Summary** | `GET /_matrix/client/v1/room_summary/{roomIdOrAlias}` | Preview room without joining |
-| **Auth Metadata** | `GET /_matrix/client/v1/auth_metadata` | Authentication method discovery |
-| **Login Token** | `POST /_matrix/client/v1/login/get_token` | Generate short-lived login token (QR code login) |
-| **Custom Profile** | `GET /_matrix/client/v3/profile/{userId}/{keyName}` | Get custom profile attribute |
-| | `PUT /_matrix/client/v3/profile/{userId}/{keyName}` | Set custom profile attribute |
-| | `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` | Delete custom profile attribute |
-| **Reporting** | `POST /_matrix/client/v3/rooms/{roomId}/report` | Report a room |
-| | `POST /_matrix/client/v3/users/{userId}/report` | Report a user |
-| **Admin** | `GET /_matrix/client/v3/admin/whois/{userId}` | Get user session/device info |
-| **Timestamps** | `GET /_matrix/client/v3/rooms/{roomId}/timestamp_to_event` | Find event by timestamp |
-| **3PID** | `POST /_matrix/client/v3/account/3pid/email/requestToken` | Request email verification |
-| | `POST /_matrix/client/v3/account/3pid/submit_token` | Submit verification code |
-| | `POST /_matrix/client/v3/account/3pid/add` | Add verified 3PID to account |
-| **Federation** | `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}` | Third-party invite exchange |
-| **Sync Filters** | Filter loading and application | Filters are now applied during sync |
-
-## Admin Dashboard
-
-Access the admin dashboard at `/admin` on your server (e.g., `https://m.easydemo.org/admin`).
-
-**Features:**
-- **Dashboard** - Server stats, activity charts, user breakdown visualization
-- **User Management** - Create, deactivate, purge users; reset passwords; bulk operations
-- **Room Management** - View rooms, members, state; delete rooms; browse events
-- **Media Management** - View uploads, quarantine/delete media
-- **Reports** - Review and resolve content reports
-- **Federation** - Monitor federation status with other servers
-- **Identity Providers** - Configure OIDC/OAuth providers (Google, etc.)
-- **Settings** - Toggle registration, send server notices
-
-**Keyboard Shortcuts:**
-- `Cmd/Ctrl+K` - Command palette
-- `g h` - Go to Dashboard
-- `g u` - Go to Users
-- `g r` - Go to Rooms
-- `/` - Focus search
-- `?` - Show shortcuts help
-
-**Synapse API Compatibility:**
-Standard `/_synapse/admin/*` endpoints are available for compatibility with existing Matrix admin tools.
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Run locally
-npm run dev
-
-# Type check
-npm run typecheck
-
-# Run tests
-npm run test
-
-# Apply migrations locally
-npm run db:migrate:local
-```
-
-## Cloudflare Bindings
-
-| Binding | Type | Purpose |
-|---------|------|---------|
-| `DB` | D1 | SQLite database for persistent data |
-| `SESSIONS` | KV | Access tokens and refresh tokens (with TTL) |
-| `DEVICE_KEYS` | KV | E2EE device keys |
-| `ONE_TIME_KEYS` | KV | Olm prekeys |
-| `CROSS_SIGNING_KEYS` | KV | Cross-signing keys |
-| `CACHE` | KV | General caching (presence, federation txns, sync filters) |
-| `ACCOUNT_DATA` | KV | User account data |
-| `MEDIA` | R2 | Media file storage |
-| `ROOMS` | Durable Object | Room coordination |
-| `SYNC` | Durable Object | Sync state management |
-| `FEDERATION` | Durable Object | Federation queue |
-| `CALL_ROOMS` | Durable Object | Video call room coordination |
-| `USER_KEYS` | Durable Object | E2EE key operations |
-| `PUSH` | Durable Object | Push notification queue |
-| `ADMIN` | Durable Object | Admin operations |
-| `RATE_LIMIT` | Durable Object | Rate limiting |
-| `ROOM_JOIN_WORKFLOW` | Workflow | Async room join processing |
-| `PUSH_NOTIFICATION_WORKFLOW` | Workflow | Async push delivery |
-
-## Security
-
-- **Password Hashing**: PBKDF2-SHA256 (100,000 iterations)
-- **Token Format**: Secure random with user binding
-- **Token Refresh**: Single-use refresh tokens with automatic rotation
-- **Rate Limiting**: Sliding window per-IP and per-user via Durable Objects
-- **Federation Auth**: Ed25519 request signing with X-Matrix header validation
-- **PDU Validation**: Signature verification on incoming federation events
-- **Media Auth**: Authenticated media endpoints (MSC3916)
-
-## Compatibility
-
-Tested with:
-- Element Web
-- Element X (iOS)
-- Element X (Android)
-
-Federation tested with:
-- matrix.org ([view test results](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org))
-
-## Limitations
-
-| Constraint | Limit | Notes |
-|------------|-------|-------|
-| Worker CPU | 30s | Use Workflows for long operations |
-| Worker Memory | 128MB | Stream large responses |
-| D1 Database | 10GB | Archive old events if needed |
-| R2 Object | 5GB | Chunked upload supported |
-| KV Value | 25MB | Split large datasets |
+The test suite covers these changes; it is not a full Matrix conformance suite. Upstream contains experimental and incomplete endpoints, so broader federation, OIDC and client interoperability should be validated before expanding usage.
 
 ## License
 
-MIT
+[MIT](LICENSE). Original authorship and license are retained.

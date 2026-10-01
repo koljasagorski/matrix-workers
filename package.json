@@ -5,22 +5,29 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 execute tuwunel-db --file=./migrations/schema.sql",
-    "db:migrate:local": "wrangler d1 execute tuwunel-db --local --file=./migrations/schema.sql",
-    "test": "vitest",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "npm run db:migrate && wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/"
+    "types": "wrangler types --env-interface CloudflareBindings",
+    "check": "npm run typecheck && npm test && npm audit --audit-level=high && npm run build",
+    "admin:create": "node scripts/create-admin.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@cloudflare/workers-types": "^4.20241127.0",
-    "hono": "^4.6.0",
-    "uuid": "^10.0.0"
+    "hono": "^4.13.12"
   },
   "devDependencies": {
-    "@types/uuid": "^10.0.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "wrangler": "^4.61.0"
+    "@types/node": "^22.20.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.145.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

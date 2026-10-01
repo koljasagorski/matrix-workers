@@ -41,3 +41,8 @@ coverage/
 droplet*.json
 register-admin.json
 test-jwt.json
+
+# Local admin credentials and private working files
+.local/
+.env.*
+.dev.vars.*
