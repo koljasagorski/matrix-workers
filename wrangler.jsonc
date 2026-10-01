@@ -102,23 +102,23 @@
     },
     {
       "tag": "v2",
-      "new_classes": ["CallRoomDurableObject"]
+      "new_sqlite_classes": ["CallRoomDurableObject"]
     },
     {
       "tag": "v3",
-      "new_classes": ["AdminDurableObject"]
+      "new_sqlite_classes": ["AdminDurableObject"]
     },
     {
       "tag": "v4",
-      "new_classes": ["UserKeysDurableObject"]
+      "new_sqlite_classes": ["UserKeysDurableObject"]
     },
     {
       "tag": "v5",
-      "new_classes": ["PushDurableObject"]
+      "new_sqlite_classes": ["PushDurableObject"]
     },
     {
       "tag": "v6",
-      "new_classes": ["RateLimitDurableObject"]
+      "new_sqlite_classes": ["RateLimitDurableObject"]
     }
   ],
 
