@@ -14,6 +14,8 @@
 | Workflows | `matrix-workers-room-join`, `matrix-workers-push-notification` |
 | Registration | Closed by default; controlled through `/admin` |
 
+All eight Durable Objects use SQLite-backed namespaces.
+
 The Worker, resources and GitHub build connection were provisioned through Cloudflare MCP. `wrangler.jsonc` is the source of truth for bindings, domain, compatibility date and non-secret settings. Public `workers.dev` and version preview URLs are disabled.
 
 ## Automatic deployments
@@ -27,7 +29,7 @@ Cloudflare Workers Builds is connected to GitHub with:
 - Deploy command: `npm run deploy`
 - Node version: `22.22.3`
 
-Pushes trigger builds, including documentation changes. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub Actions also runs checks and CodeQL but is not the deployment mechanism.
+The GitHub `CI` workflow invokes a Cloudflare Deploy Hook after its check and CodeQL jobs succeed on `main`. The hook URL is held in the GitHub repository secret `CLOUDFLARE_DEPLOY_HOOK`. It is not committed. Pushes trigger builds, including documentation changes. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub’s deploy job confirms the build request was accepted; the final build/deployment result is reported in Cloudflare Workers Builds. Rotate the hook in Cloudflare and update the repository secret together if necessary.
 
 To redeploy manually with authenticated Cloudflare CLI access:
 

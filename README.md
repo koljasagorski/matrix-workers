@@ -64,14 +64,14 @@ Open `http://localhost:8787/admin`. The admin creation command saves the generat
 
 Cloudflare Workers Builds is connected to this repository's `main` branch:
 
-1. A push to `main` starts a Cloudflare build.
+1. A push to `main` runs GitHub CI. After checks and CodeQL pass, a secret Deploy Hook starts a Cloudflare build.
 2. Dependencies install from `package-lock.json` using `npm ci`.
 3. `npm run check` must pass.
 4. `npm run deploy` applies pending D1 migrations and deploys to `m.sgr.ski`.
 
-GitHub Actions independently checks changes and runs CodeQL. Dependabot proposes weekly npm and GitHub Actions updates; updates are reviewed and merged before they reach production. Pull requests do not deploy to production.
+GitHub Actions checks changes and runs CodeQL before requesting deployment. Dependabot proposes weekly npm and GitHub Actions updates; updates are reviewed and merged before they reach production. Pull requests do not deploy to production.
 
-The Cloudflare build integration holds its deployment credentials. No Cloudflare API token belongs in the repository. Resource IDs and the domain in `wrangler.jsonc` are specific to this installation; forks need their own resources.
+The Cloudflare build integration holds its deployment credentials. GitHub stores only `CLOUDFLARE_DEPLOY_HOOK` as a repository secret; its URL authorizes builds of this Worker’s `main` branch. Neither that URL nor any Cloudflare API token belongs in the repository. Resource IDs and the domain in `wrangler.jsonc` are specific to this installation; forks need their own resources.
 
 ## Architecture
 
