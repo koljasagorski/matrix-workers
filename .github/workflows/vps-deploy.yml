@@ -1,0 +1,74 @@
+name: Reviewed VPS deployment
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: matrix-vps-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: matrix-vps
+    steps:
+      # This privileged workflow never checks out or executes repository/PR code.
+      # Only GitHub API metadata for successful main push CI is consumed.
+      - name: Verify current main has passed the trusted full CI workflow
+        id: reviewed
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const repository = context.repo;
+            const { data: branch } = await github.rest.repos.getBranch({ ...repository, branch: 'main' });
+            const sha = branch.commit.sha;
+            if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('Invalid public main SHA');
+            let run;
+            if (context.eventName === 'workflow_run') {
+              const response = await github.rest.actions.getWorkflowRun({ ...repository, run_id: context.payload.workflow_run.id });
+              run = response.data;
+            } else {
+              const response = await github.rest.actions.listWorkflowRuns({ ...repository, workflow_id: 'security.yml',
+                branch: 'main', event: 'push', status: 'completed', per_page: 100 });
+              run = response.data.workflow_runs.find(candidate => candidate.head_sha === sha && candidate.conclusion === 'success');
+            }
+            if (!run || run.path !== '.github/workflows/security.yml' || run.event !== 'push' ||
+                run.head_branch !== 'main' || run.head_sha !== sha || run.status !== 'completed' || run.conclusion !== 'success' ||
+                run.head_repository.full_name !== `${repository.owner}/${repository.repo}`) {
+              throw new Error('Current main has no verified successful push CI');
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, { ...repository, run_id: run.id, filter: 'latest', per_page: 100 });
+            for (const name of ['check (22)', 'check (24)', 'codeql', 'migration-check']) {
+              if (!jobs.some(job => job.name === name && job.conclusion === 'success')) throw new Error('Required CI job failed: ' + name);
+            }
+            core.setOutput('sha', sha);
+      - name: Submit only the reviewed commit SHA to the VPS forced command
+        env:
+          REVIEWED_SHA: ${{ steps.reviewed.outputs.sha }}
+          MATRIX_VPS_SSH_KEY: ${{ secrets.MATRIX_VPS_SSH_KEY }}
+          MATRIX_VPS_KNOWN_HOSTS: ${{ vars.MATRIX_VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$MATRIX_VPS_SSH_KEY"
+          test -n "$MATRIX_VPS_KNOWN_HOSTS"
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          private_directory=$(mktemp -d "$RUNNER_TEMP/matrix-deploy-ssh.XXXXXX")
+          trap 'rm -rf -- "$private_directory"' EXIT
+          printf '%s\n' "$MATRIX_VPS_SSH_KEY" > "$private_directory/key"
+          printf '%s\n' "$MATRIX_VPS_KNOWN_HOSTS" > "$private_directory/known_hosts"
+          printf '%s\n' "$REVIEWED_SHA" | ssh -T \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$private_directory/known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            -i "$private_directory/key" matrix-deploy@nbg.patchletter.com

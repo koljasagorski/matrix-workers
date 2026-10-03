@@ -35,6 +35,8 @@ jobs:
         run: node --test .github/scripts/check-update-policy.cjs
       - name: Test the public production-check policy using fake responses
         run: node --test .github/scripts/check-production-health-policy.cjs
+      - name: Test the trusted-main VPS deployment policy using fake API responses
+        run: node --test deploy/vps/tests/check-workflow-policy.cjs
       - run: npm run check
       - name: Validate D1 migrations on the Workers runtime
         run: npm run db:migrate:local
@@ -55,6 +57,57 @@ jobs:
           languages: javascript-typescript
           build-mode: none
       - uses: github/codeql-action/analyze@7999b86c43a865dc79d8923397f35af22de63401 # v4
+  migration-check:
+    name: migration-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the deployment's pinned Synapse image
+        id: synapse
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          compose = pathlib.Path('deploy/vps/docker-compose.yml').read_text()
+          images = re.findall(r'^    image: (ghcr\.io/element-hq/synapse:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64})$', compose, re.M)
+          if len(images) != 1:
+              raise SystemExit('Expected one digest-pinned Synapse deployment image')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('image=' + images[0] + '\n')
+              postgres = re.findall(r'^    image: (postgres:\d+-alpine@sha256:[0-9a-f]{64})$', compose, re.M)
+              if len(postgres) != 1:
+                  raise SystemExit('Expected one digest-pinned PostgreSQL deployment image')
+              output.write('postgres=' + postgres[0] + '\n')
+          PY
+      - name: Test signed native room import against the deployment codec
+        env:
+          SYNAPSE_IMAGE: ${{ steps.synapse.outputs.image }}
+        run: |
+          docker run --rm --network none \
+            --volume "$PWD/scripts/migration:/migration:ro" \
+            --entrypoint python "$SYNAPSE_IMAGE" \
+            -m unittest discover -s /migration/rooms/tests -v
+      - name: Boot native schema and verify a complete synthetic room migration
+        env:
+          SYNAPSE_IMAGE: ${{ steps.synapse.outputs.image }}
+          POSTGRES_IMAGE: ${{ steps.synapse.outputs.postgres }}
+        run: |
+          python3 scripts/migration/rooms/tests/ci_smoke.py \
+            --synapse-image "$SYNAPSE_IMAGE" --postgres-image "$POSTGRES_IMAGE"
+      - name: Test gateway, archive, auth and encrypted user-data migration
+        run: |
+          python3 -m venv "$RUNNER_TEMP/matrix-migration-venv"
+          "$RUNNER_TEMP/matrix-migration-venv/bin/pip" install \
+            --requirement scripts/migration/auth/requirements.txt \
+            --requirement scripts/migration/requirements-federation-replay.txt
+          "$RUNNER_TEMP/matrix-migration-venv/bin/python" -m unittest discover -s scripts/migration/auth/tests -v
+          "$RUNNER_TEMP/matrix-migration-venv/bin/python" -m unittest discover -s scripts/migration/archive_tests -v
+          "$RUNNER_TEMP/matrix-migration-venv/bin/python" -m unittest discover -s scripts/migration/media_tests -v
+          "$RUNNER_TEMP/matrix-migration-venv/bin/python" -m unittest discover -s scripts/migration/replay_tests -v
+      - name: Test reviewed VPS deployment and rollback with fake operations
+        run: python3 -m unittest discover -s deploy/vps/tests -v
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

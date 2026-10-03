@@ -1,0 +1,48 @@
+# Getrennter Matrix-Stack; Datenbank und Synapse teilen keine Patchletter-Daten.
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    container_name: matrix-postgres
+    restart: unless-stopped
+    env_file: postgres.env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - matrix
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U matrix -d synapse']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+    cpus: 2
+    security_opt:
+      - no-new-privileges:true
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.162.0@sha256:6b84a7bbac36f080b2d2e51e0289cf1b08b349598ea44a558df38d558f2c2311
+    container_name: matrix-synapse
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      PYTHONPATH: /modules
+    volumes:
+      - ./synapse/data:/data
+      - ./modules:/modules:ro
+      - ./compat/federation:/migration-federation:ro
+    ports:
+      - '127.0.0.1:18008:8008'
+    networks:
+      - matrix
+    mem_limit: 4g
+    cpus: 3
+    security_opt:
+      - no-new-privileges:true
+networks:
+  matrix:
+    external: true
+    name: matrix-internal
+volumes:
+  postgres-data:

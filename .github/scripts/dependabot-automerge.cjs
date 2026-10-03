@@ -1,9 +1,11 @@
 'use strict';
 
 const { isDeepStrictEqual } = require('node:util');
-const REQUIRED_CHECKS = ['check (22)', 'check (24)', 'codeql', 'dependency-review'];
+const REQUIRED_CHECKS = ['check (22)', 'check (24)', 'codeql', 'migration-check', 'dependency-review'];
 const DEPENDABOT_ID = 49699333;
 const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const PIP_MANIFESTS = ['scripts/migration/auth/requirements.txt', 'scripts/migration/requirements-federation-replay.txt'];
+const COMPOSE_MANIFEST = 'deploy/vps/docker-compose.yml';
 
 function version(value) {
   const match = typeof value === 'string' && value.match(/^[~^=]?(\d+)\.(\d+)\.(\d+)$/);
@@ -58,6 +60,40 @@ function actionChanges(before, after) {
   return changes.length ? changes : null;
 }
 
+function compatiblePipUpdate(before, after) {
+  const a = before.split('\n'); const b = after.split('\n');
+  if (a.length !== b.length) return false;
+  const requirement = /^([A-Za-z][A-Za-z0-9._-]*(?:\[[A-Za-z0-9_.,-]+\])?==)(\d+\.\d+\.\d+)([ \t]*(?:#.*)?)$/;
+  let changed = false;
+  for (let index = 0; index < a.length; index++) {
+    if (a[index] === b[index]) continue;
+    const old = a[index].match(requirement); const next = b[index].match(requirement);
+    if (!old || !next || old[1] !== next[1] || old[3] !== next[3] ||
+        !compatibleVersion(old[2], next[2]) || old[2] === next[2]) return false;
+    changed = true;
+  }
+  return changed;
+}
+
+function compatibleComposeUpdate(before, after) {
+  const a = before.split('\n'); const b = after.split('\n');
+  if (a.length !== b.length) return false;
+  const image = /^([ \t]+image:[ \t]+)(postgres|ghcr\.io\/element-hq\/synapse):((?:\d+-alpine)|(?:v\d+\.\d+\.\d+))@sha256:([0-9a-f]{64})([ \t]*)$/;
+  let changed = false;
+  for (let index = 0; index < a.length; index++) {
+    if (a[index] === b[index]) continue;
+    const old = a[index].match(image); const next = b[index].match(image);
+    // Retain the reviewed Synapse version (the temporary private API module is
+    // version-pinned) and PostgreSQL major/variant. Migration CI boots both exact
+    // candidate digests before these changes can be merged and deployed.
+    if (!old || !next || old[1] !== next[1] || old[2] !== next[2] || old[3] !== next[3] ||
+        old[5] !== next[5] || old[4] === next[4] ||
+        (next[2] === 'postgres' ? !/^\d+-alpine$/.test(next[3]) : !/^v\d+\.\d+\.\d+$/.test(next[3]))) return false;
+    changed = true;
+  }
+  return changed;
+}
+
 async function mergeTestedUpdate({ github, context, core }) {
   const run = context.payload.workflow_run;
   const repo = context.repo;
@@ -69,7 +105,7 @@ async function mergeTestedUpdate({ github, context, core }) {
   const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: candidates[0].number });
   if (pr.user?.login !== 'dependabot[bot]' || pr.user.id !== DEPENDABOT_ID || pr.user.type !== 'Bot' || pr.draft ||
       pr.base.ref !== 'main' || pr.base.repo.full_name !== fullName || pr.head.repo?.full_name !== fullName ||
-      pr.head.sha !== run.head_sha || !/^dependabot\/(npm_and_yarn|github_actions)\//.test(pr.head.ref) || pr.mergeable_state !== 'clean') {
+      pr.head.sha !== run.head_sha || !/^dependabot\/(npm_and_yarn|github_actions|pip|docker_compose)\//.test(pr.head.ref) || pr.mergeable_state !== 'clean') {
     return skip('PR identity, tested commit, base, or mergeability changed');
   }
   const result = await github.graphql(`query($owner:String!,$name:String!){repository(owner:$owner,name:$name){ref(qualifiedName:"refs/heads/main"){branchProtectionRule{requiresStatusChecks requiresStrictStatusChecks requiredStatusCheckContexts}}}}`, { owner: repo.owner, name: repo.repo });
@@ -90,6 +126,16 @@ async function mergeTestedUpdate({ github, context, core }) {
     const documents = await Promise.all(['package.json', 'package-lock.json'].flatMap(path => [read(path, pr.base.sha), read(path, pr.head.sha)]));
     const [before, after, oldLock, newLock] = documents.map(document => JSON.parse(document));
     if (!compatibleNpmUpdate(before, after, oldLock, newLock)) return skip('major, prerelease, source, or non-dependency change needs review');
+  } else if (pr.head.ref.startsWith('dependabot/pip/')) {
+    for (const file of files) {
+      if (!PIP_MANIFESTS.includes(file.filename)) return skip('pip PR changes files outside the exact pinned requirements');
+      const [before, after] = await Promise.all([read(file.filename, pr.base.sha), read(file.filename, pr.head.sha)]);
+      if (!compatiblePipUpdate(before, after)) return skip('pip source, extras, major, prerelease, or non-version change needs review');
+    }
+  } else if (pr.head.ref.startsWith('dependabot/docker_compose/')) {
+    if (files.length !== 1 || files[0].filename !== COMPOSE_MANIFEST) return skip('Compose PR changes files outside the deployment manifest');
+    const [before, after] = await Promise.all([read(COMPOSE_MANIFEST, pr.base.sha), read(COMPOSE_MANIFEST, pr.head.sha)]);
+    if (!compatibleComposeUpdate(before, after)) return skip('container version, registry, variant, or deployment change needs review');
   } else {
     const changes = [];
     for (const file of files) {
@@ -110,7 +156,7 @@ async function mergeTestedUpdate({ github, context, core }) {
   if (current.head.sha !== pr.head.sha || current.base.sha !== pr.base.sha || current.state !== 'open' || current.mergeable_state !== 'clean') return skip('PR changed during verification');
   const { data: merged } = await github.rest.pulls.merge({ ...repo, pull_number: pr.number, sha: pr.head.sha, merge_method: 'squash' });
   if (!merged.merged) throw new Error(`GitHub refused the protected merge: ${merged.message}`);
-  core.info(`Merged tested Dependabot PR #${pr.number}. Cloudflare Workers Builds handles the production rollout.`);
+  core.info(`Merged tested Dependabot PR #${pr.number}. The protected VPS deployment handles the production rollout.`);
 }
 
 async function mergePendingUpdates({ github, context, core }) {
@@ -128,4 +174,4 @@ async function mergePendingUpdates({ github, context, core }) {
   }
 }
 
-module.exports = { REQUIRED_CHECKS, compatibleVersion, compatibleNpmUpdate, actionChanges, mergeTestedUpdate, mergePendingUpdates };
+module.exports = { REQUIRED_CHECKS, compatibleVersion, compatibleNpmUpdate, actionChanges, compatiblePipUpdate, compatibleComposeUpdate, mergeTestedUpdate, mergePendingUpdates };

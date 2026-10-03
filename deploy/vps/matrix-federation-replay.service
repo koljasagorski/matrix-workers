@@ -1,0 +1,23 @@
+[Unit]
+Description=Resume original Matrix federation transactions after migration
+After=network-online.target matrix-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matrix
+Group=matrix
+WorkingDirectory=/opt/matrix/compat
+ExecStart=/opt/matrix/compat/venv/bin/python /opt/matrix/compat/replay/replay-federation.py --config /opt/matrix/compat/federation-replay.json
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/matrix/compat
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

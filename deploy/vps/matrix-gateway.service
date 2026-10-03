@@ -1,0 +1,26 @@
+[Unit]
+Description=Matrix session and historical-room compatibility gateway
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matrix
+Group=matrix
+Environment=PYTHONPATH=/opt/matrix/compat/auth:/opt/matrix/compat/archive
+Environment=MATRIX_ARCHIVE_SOURCE=/opt/matrix/compat/archive/archive.sqlite
+Environment=MATRIX_ARCHIVE_MANIFEST=/opt/matrix/compat/archive/manifest.json
+WorkingDirectory=/opt/matrix/compat
+ExecStart=/opt/matrix/compat/venv/bin/python -m migration_auth.gateway --config /opt/matrix/compat/gateway.json
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/matrix/compat
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

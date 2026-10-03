@@ -1,0 +1,12 @@
+[Unit]
+Description=Matrix PostgreSQL, keys and media backup
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/matrix/bin/backup.sh
+TimeoutStartSec=600
+UMask=0077
+Nice=10
+IOSchedulingClass=idle

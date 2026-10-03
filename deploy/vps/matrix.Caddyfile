@@ -1,0 +1,18 @@
+# Matrix verwendet denselben TLS-Endpunkt wie Patchletter, aber einen eigenen Dienst.
+http://m.sgr.ski {
+    handle /.well-known/acme-challenge/* {
+        root * /srv/acme
+        file_server
+    }
+    handle {
+        redir https://{host}{uri} permanent
+    }
+}
+m.sgr.ski {
+    tls /data/matrix/fullchain.pem /data/matrix/privkey.pem
+    encode zstd gzip
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy 172.20.0.1:18009 {
+        header_up X-Forwarded-For {remote_host}
+    }
+}

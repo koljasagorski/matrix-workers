@@ -1,0 +1,10 @@
+[Unit]
+Description=Matrix backup every fifteen minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

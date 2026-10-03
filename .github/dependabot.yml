@@ -27,3 +27,34 @@ updates:
       compatible-action-updates:
         patterns: ['*']
         update-types: [minor, patch]
+  # Compose has its own ecosystem; Dockerfile-only scans miss these images.
+  - package-ecosystem: docker-compose
+    directory: /deploy/vps
+    schedule:
+      interval: daily
+      time: '05:43'
+      timezone: Europe/Berlin
+    open-pull-requests-limit: 5
+    groups:
+      compatible-container-updates:
+        patterns: ['*']
+        update-types: [minor, patch]
+  - package-ecosystem: pip
+    # aiohttp is pinned in both manifests; update them in the same tested PR.
+    directories:
+      - /scripts/migration/auth
+      - /scripts/migration
+    schedule:
+      interval: daily
+      time: '05:49'
+      timezone: Europe/Berlin
+    open-pull-requests-limit: 5
+    groups:
+      compatible-python-updates:
+        applies-to: version-updates
+        patterns: ['*']
+        update-types: [minor, patch]
+      compatible-python-security-updates:
+        applies-to: security-updates
+        patterns: ['*']
+        update-types: [minor, patch]
