@@ -169,13 +169,45 @@ describe('resumable signed room upgrades', () => {
   });
 
   it.each(['10', '11'])('links predecessor to the exact signed tombstone when replacing with v%s', async version => {
-    const old = await create();
+    const oldVersion = version === '10' ? '11' : '10';
+    const old = await create({ room_version: oldVersion });
     const next = await replacement(await upgrade(old, version));
     await assertGraph(next, version);
     const tombstone = (await getRoomState(ctx.env.DB, old)).find(event => event.type === 'm.room.tombstone')!;
     const created = (await getRoomState(ctx.env.DB, next)).find(event => event.type === 'm.room.create')!;
     expect(created.content.predecessor).toEqual({ room_id: old, event_id: tombstone.event_id });
-    assertSigned(tombstone, '10');
+    assertSigned(tombstone, oldVersion);
+  });
+
+  it.each(['10', '11', '12'])('rejects new same-version v%s upgrades without reserving or cloning rooms', async version => {
+    const old = await create({ room_version: version });
+    const before = ctx.sqlite.prepare('SELECT count(*) AS n FROM events').get();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await upgrade(old, version);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ errcode: 'M_INVALID_PARAM' });
+    }
+    expect(job(old)).toBeUndefined();
+    expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get()).toEqual({ n: 1 });
+    expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM events').get()).toEqual(before);
+    expect((await getRoomState(ctx.env.DB, old)).some(event => event.type === 'm.room.tombstone')).toBe(false);
+  });
+
+  it('resumes existing same-version reservations and preserves completed and historical replacement retries', async () => {
+    const old = await create();
+    ctx.sqlite.prepare(`INSERT INTO room_upgrades(old_room_id,new_version,actor_user_id,additional_creators,created_at,updated_at)
+      VALUES(?, '10', ?, '[]', ?, ?)`).run(old, alice, Date.now(), Date.now());
+    const next = await replacement(await upgrade(old, '10'));
+    expect(next).not.toBe(old);
+    expect(job(old)).toMatchObject({ phase: 'complete', replacement_room_id: next });
+    await assertGraph(next, '10');
+    const before = ctx.sqlite.prepare('SELECT count(*) AS n FROM events').get();
+    expect(await replacement(await upgrade(old, '10'))).toBe(next);
+    ctx.sqlite.prepare('DELETE FROM room_upgrades WHERE old_room_id=?').run(old);
+    expect(await replacement(await upgrade(old, '10'))).toBe(next);
+    expect(job(old)).toBeUndefined();
+    expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get()).toEqual({ n: 2 });
+    expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM events').get()).toEqual(before);
   });
 
   it('invites other local members through authorized events and preserves bans without forging their joins', async () => {
@@ -196,6 +228,7 @@ describe('resumable signed room upgrades', () => {
     await registerBob(); const old = await create({ preset: 'public_chat' });
     expect((await request(path(old, 'join'), {}, 'bob-token')).status).toBe(200);
     expect((await upgrade(old, '12', {}, 'bob-token')).status).toBe(403);
+    expect((await upgrade(old, '10', {}, 'bob-token')).status).toBe(403);
     expect(job(old)).toBeUndefined();
     expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get()).toEqual({ n: 1 });
     const next = await replacement(await upgrade(old));

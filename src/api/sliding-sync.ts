@@ -5,6 +5,7 @@ import { Hono, type Context } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { initialRoomHistory } from '../services/sync-history';
 import { Errors } from '../utils/errors';
+import { sha256 } from '../utils/crypto';
 import { getStoredInviteState } from '../services/remote-invites';
 import { requireAuth } from '../middleware/auth';
 import { getToDeviceMessages } from './to-device';
@@ -66,6 +67,7 @@ interface SlidingRoomFilter {
   spaces?: string[];
   is_encrypted?: boolean;
   is_invite?: boolean;
+  is_invited?: boolean;
   is_tombstoned?: boolean;
   room_types?: string[];
   not_room_types?: string[];
@@ -195,6 +197,9 @@ interface ConnectionState {
     sentState: boolean;
     timelineLimit?: number;
     historyVersion?: number;
+    stateVersion?: number;
+    isDm?: boolean;
+    stateFingerprint?: string;
     requiredState?: [string, string][];
     membership?: string;
   }>;
@@ -284,6 +289,27 @@ async function saveConnectionState(
   }
 }
 
+function directRoomIds(content?: string): Set<string> {
+  try {
+    const map = JSON.parse(content ?? '{}');
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return new Set();
+    return new Set(Object.values(map).flatMap(value => Array.isArray(value)
+      ? value.filter((room): room is string => typeof room === 'string') : []));
+  } catch { return new Set(); }
+}
+
+function roomStateFingerprint(room: RoomResult): Promise<string> {
+  // Redactions change state content while retaining the original event ID.
+  // Store a small digest rather than duplicating potentially large room state
+  // in the connection's Durable Object value.
+  const state = [...(room.required_state ?? [])].sort((a, b) => a.event_id.localeCompare(b.event_id));
+  return sha256(JSON.stringify({
+    state: state.map(event => [event.event_id, event.content, event.unsigned]),
+    name: room.name, avatar: room.avatar, topic: room.topic, canonicalAlias: room.canonical_alias,
+    heroes: room.heroes, joinedCount: room.joined_count, invitedCount: room.invited_count,
+  }));
+}
+
 // Get rooms for a user with optional filtering
 // OPTIMIZED: Uses consolidated query with subqueries to avoid N+1 problem
 async function getUserRooms(
@@ -308,12 +334,7 @@ async function getUserRooms(
        JOIN events e ON rs.event_id = e.event_id
        WHERE rs.room_id = rm.room_id AND rs.event_type = 'm.room.name'
        LIMIT 1
-      ) as room_name,
-      -- Subquery for member count (for DM detection)
-      (SELECT COUNT(*)
-       FROM room_memberships rm2
-       WHERE rm2.room_id = rm.room_id AND rm2.membership = 'join'
-      ) as member_count
+      ) as room_name
     FROM room_memberships rm
     JOIN rooms r ON rm.room_id = r.room_id
     WHERE rm.user_id = ?
@@ -321,14 +342,13 @@ async function getUserRooms(
   const params: any[] = [userId];
 
   // Apply filters
-  if (filters?.is_invite) {
-    query += ` AND rm.membership = 'invite'`;
-  } else if (filters?.is_tombstoned) {
-    // Check for tombstone state
-    query += ` AND EXISTS (SELECT 1 FROM room_state rs JOIN events e ON rs.event_id = e.event_id WHERE rs.room_id = rm.room_id AND rs.event_type = 'm.room.tombstone')`;
-  } else {
-    // By default, only return rooms the user has joined or been invited to
-    query += ` AND rm.membership IN ('join', 'invite')`;
+  query += ` AND rm.membership IN ('join', 'invite')`;
+  const isInvited = filters?.is_invited ?? filters?.is_invite;
+  if (isInvited !== undefined) {
+    query += isInvited ? ` AND rm.membership = 'invite'` : ` AND rm.membership = 'join'`;
+  }
+  if (filters?.is_tombstoned !== undefined) {
+    query += ` AND ${filters.is_tombstoned ? '' : 'NOT '}EXISTS (SELECT 1 FROM room_state rs WHERE rs.room_id = rm.room_id AND rs.event_type = 'm.room.tombstone' AND rs.state_key = '')`;
   }
 
   // Default sort: by recency
@@ -341,16 +361,17 @@ async function getUserRooms(
     query += ` ORDER BY last_activity DESC`;
   }
 
-  const result = await db.prepare(query).bind(...params).all();
+  const [result, direct] = await db.batch([
+    db.prepare(query).bind(...params),
+    db.prepare("SELECT content FROM account_data WHERE user_id=? AND room_id='' AND event_type='m.direct'").bind(userId),
+  ]);
+  const dms = directRoomIds((direct.results[0] as { content: string } | undefined)?.content);
 
   const rooms: { roomId: string; membership: string; lastActivity: number; name?: string; isDm: boolean }[] = [];
 
   for (const row of result.results as any[]) {
     const name = row.room_name as string | null | undefined;
-    const memberCount = row.member_count as number;
-
-    // A DM is typically a room with 2 members and no explicit name
-    const isDm = memberCount <= 2 && !name;
+    const isDm = dms.has(row.room_id);
 
     // Apply filters in memory (already have all data)
     if (filters?.room_name_like && name) {
@@ -406,6 +427,7 @@ async function getRoomData(
     joinedCountResult,
     invitedCountResult,
     heroesResult,
+    directResult,
   ] = await db.batch([
     // 1. Room info
     db.prepare(`SELECT room_id, created_at FROM rooms WHERE room_id = ?`).bind(roomId),
@@ -439,11 +461,13 @@ async function getRoomData(
     db.prepare(`SELECT COUNT(*) as count FROM room_memberships WHERE room_id = ? AND membership = 'invite'`).bind(roomId),
     // 8. Heroes (other members for display)
     db.prepare(`
-      SELECT user_id, display_name, avatar_url
-      FROM room_memberships
-      WHERE room_id = ? AND membership = 'join' AND user_id != ?
+      SELECT rm.user_id, rm.display_name, rm.avatar_url
+      FROM room_memberships rm LEFT JOIN events e ON e.event_id=rm.event_id AND e.room_id=rm.room_id
+      WHERE rm.room_id = ? AND rm.membership IN ('join', 'invite') AND rm.user_id != ?
+      ORDER BY e.stream_ordering, rm.user_id
       LIMIT 5
     `).bind(roomId, userId),
+    db.prepare("SELECT content FROM account_data WHERE user_id=? AND room_id='' AND event_type='m.direct'").bind(userId),
   ]);
 
   // Check if room exists
@@ -460,7 +484,7 @@ async function getRoomData(
   const invitedCount = (invitedCountResult.results[0] as { count: number } | undefined)?.count || 0;
   result.joined_count = joinedCount;
   result.invited_count = invitedCount;
-  result.is_dm = joinedCount <= 2;
+  result.is_dm = directRoomIds((directResult.results[0] as { content: string } | undefined)?.content).has(roomId);
 
   // Room name
   const nameEvent = nameResult.results[0] as { content: string } | undefined;
@@ -504,10 +528,16 @@ async function getRoomData(
   }
 
   // Get required state
-  if (config.requiredState && config.requiredState.length > 0) {
+  const requiredState: [string, string][] = [
+    ...(config.requiredState ?? []), ['m.room.create', ''], ['m.room.encryption', ''],
+    ['m.room.tombstone', ''], ['m.room.power_levels', ''], ['m.room.join_rules', ''],
+    ['m.room.history_visibility', ''], ['m.room.member', '$ME'],
+  ];
+  {
     result.required_state = [];
-
-    for (const [eventType, stateKey] of config.requiredState) {
+    const seenState = new Set<string>();
+    const stateQueries: D1PreparedStatement[] = [];
+    for (const [eventType, stateKey] of requiredState) {
       let stateQuery = `
         SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
         FROM room_state rs
@@ -530,9 +560,12 @@ async function getRoomData(
         stateQuery += ` AND rs.state_key = ''`;
       }
 
-      const stateEvents = await db.prepare(stateQuery).bind(...stateParams).all();
-
+      stateQueries.push(db.prepare(stateQuery).bind(...stateParams));
+    }
+    for (const stateEvents of await db.batch(stateQueries)) {
       for (const event of stateEvents.results as any[]) {
+        if (seenState.has(event.event_id)) continue;
+        seenState.add(event.event_id);
         try {
           result.required_state.push({
             type: event.event_type,
@@ -889,7 +922,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       // Get room data for rooms in range
       for (const roomInfo of roomsInRange) {
         const roomState = connectionState.roomStates[roomInfo.roomId];
-        const isInitialRoom = !roomState?.sentState;
+        const isInitialRoom = !roomState?.sentState || roomState.membership === 'invite' || roomState.stateVersion !== 1;
         const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || 0);
 
         // Handle invited rooms differently - they get invite_state not timeline
@@ -899,7 +932,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
           response.rooms[roomInfo.roomId] = roomData;
           connectionState.roomStates[roomInfo.roomId] = {
             sentState: true,
-            lastStreamOrdering: roomSincePos,
+            lastStreamOrdering: roomSincePos, membership: 'invite',
           };
           continue;
         }
@@ -907,7 +940,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         // For joined rooms, get full room data
         const roomData = await getRoomData(c.env, roomInfo.roomId, userId, {
           requiredState: listConfig.required_state,
-          timelineLimit: listConfig.timeline_limit || 10,
+          timelineLimit: listConfig.timeline_limit ?? 10,
           initial: isInitialRoom,
           sinceStreamOrdering: isInitialRoom ? undefined : roomSincePos,
         });
@@ -917,6 +950,9 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         const prevNotificationCount = connectionState.roomNotificationCounts?.[roomInfo.roomId] ?? 0;
         const currentNotificationCount = roomData.notification_count ?? 0;
         const notificationCountChanged = hasPrevCount && currentNotificationCount !== prevNotificationCount;
+        const dmChanged = roomState?.isDm !== roomData.is_dm;
+        const stateFingerprint = await roomStateFingerprint(roomData);
+        const stateChanged = roomState?.stateFingerprint !== stateFingerprint;
 
         // Check if m.fully_read marker changed
         const fullyReadResult = await db.prepare(`
@@ -938,7 +974,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
           && !connectionState.roomSentAsRead?.[roomInfo.roomId];
 
         // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
-        if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
+        if (isInitialRoom || stateChanged || dmChanged || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
           response.rooms[roomInfo.roomId] = roomData;
 
           // Update tracked state
@@ -961,7 +997,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         const newStreamOrdering = roomData.maxStreamOrdering || roomSincePos;
         connectionState.roomStates[roomInfo.roomId] = {
           sentState: true,
-          lastStreamOrdering: newStreamOrdering,
+          lastStreamOrdering: newStreamOrdering, membership: 'join', stateVersion: 1, isDm: roomData.is_dm,
+          stateFingerprint,
         };
       }
 
@@ -986,7 +1023,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       }
 
       const roomState = connectionState.roomStates[roomId];
-      const isInitialRoom = !roomState?.sentState;
+      const isInitialRoom = !roomState?.sentState || roomState.membership === 'invite' || roomState.stateVersion !== 1;
       const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || 0);
 
       // Handle invited rooms differently - they get invite_state not timeline
@@ -996,7 +1033,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         response.rooms[roomId] = roomData;
         connectionState.roomStates[roomId] = {
           sentState: true,
-          lastStreamOrdering: roomSincePos,
+          lastStreamOrdering: roomSincePos, membership: 'invite',
         };
         continue;
       }
@@ -1004,7 +1041,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       // For joined rooms, get full room data
       const roomData = await getRoomData(c.env, roomId, userId, {
         requiredState: subscription.required_state,
-        timelineLimit: subscription.timeline_limit || 10,
+        timelineLimit: subscription.timeline_limit ?? 10,
         initial: isInitialRoom,
         sinceStreamOrdering: isInitialRoom ? undefined : roomSincePos,
       });
@@ -1014,6 +1051,9 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       const prevNotificationCount = connectionState.roomNotificationCounts?.[roomId] ?? 0;
       const currentNotificationCount = roomData.notification_count ?? 0;
       const notificationCountChanged = hasPrevCount && currentNotificationCount !== prevNotificationCount;
+      const dmChanged = roomState?.isDm !== roomData.is_dm;
+      const stateFingerprint = await roomStateFingerprint(roomData);
+      const stateChanged = roomState?.stateFingerprint !== stateFingerprint;
 
       // Check if m.fully_read marker changed
       const fullyReadResult = await db.prepare(`
@@ -1034,7 +1074,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         && !connectionState.roomSentAsRead?.[roomId];
 
       // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
-      if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
+      if (isInitialRoom || stateChanged || dmChanged || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
         response.rooms[roomId] = roomData;
 
         // Update tracked state
@@ -1056,7 +1096,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       const newStreamOrdering = roomData.maxStreamOrdering || roomSincePos;
       connectionState.roomStates[roomId] = {
         sentState: true,
-        lastStreamOrdering: newStreamOrdering,
+        lastStreamOrdering: newStreamOrdering, membership: 'join', stateVersion: 1, isDm: roomData.is_dm,
+        stateFingerprint,
       };
     }
   }
@@ -1516,7 +1557,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   }
   for (const [roomId, config] of selected) {
     const previous = connectionState.roomStates[roomId];
-    const initial = !previous?.sentState || previous.membership === 'invite';
+    const initial = !previous?.sentState || previous.membership === 'invite' || previous.stateVersion !== 1;
     const since = previous?.lastStreamOrdering ?? 0;
     if (config.membership === 'invite') {
       response.rooms[roomId] = await getInviteRoomData(db, roomId, userId); hasChanges = true;
@@ -1530,6 +1571,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       sinceStreamOrdering: initial || expanded ? undefined : since,
       liveAfter: since,
     });
+    const stateFingerprint = await roomStateFingerprint(roomData);
+    const stateEventsChanged = previous?.stateFingerprint !== stateFingerprint;
     if (expanded) {
       roomData.unstable_expanded_timeline = true;
       roomData.expanded_timeline = true;
@@ -1540,7 +1583,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       .bind(userId, roomId).first<{ content: string }>();
     const fullyRead = marker?.content ?? '';
     const readChanged = connectionState.roomFullyReadMarkers?.[roomId] !== fullyRead;
-    if (initial || expanded || stateChanged || roomData.timeline?.length || countChanged || readChanged) {
+    const dmChanged = previous?.isDm !== roomData.is_dm;
+    if (initial || expanded || stateChanged || stateEventsChanged || dmChanged || roomData.timeline?.length || countChanged || readChanged) {
       hasChanges = true;
       const { maxStreamOrdering: _, ...clientData } = roomData;
       response.rooms[roomId] = clientData;
@@ -1549,7 +1593,9 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     (connectionState.roomFullyReadMarkers ??= {})[roomId] = fullyRead;
     connectionState.roomStates[roomId] = {
       sentState: true, lastStreamOrdering: roomData.maxStreamOrdering ?? since, membership: config.membership,
-      timelineLimit: config.timelineLimit, requiredState: config.requiredState, historyVersion: 1,
+      timelineLimit: config.timelineLimit, requiredState: config.requiredState, historyVersion: 1, stateVersion: 1,
+      isDm: roomData.is_dm,
+      stateFingerprint,
     };
   }
 

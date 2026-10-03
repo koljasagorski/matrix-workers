@@ -154,6 +154,9 @@ export async function upgradeRoom(env: Env, options: UpgradeOptions): Promise<st
       if (replacement.room_version !== options.newVersion) throw Errors.invalidParam('new_version', 'Room already upgraded to another version');
       return replacement.room_id;
     }
+    if (oldRoom.room_version === options.newVersion) {
+      throw Errors.invalidParam('new_version', 'Room already uses this version');
+    }
     await env.DB.prepare(`INSERT INTO room_upgrades(old_room_id,new_version,actor_user_id,additional_creators,created_at,updated_at)
       VALUES(?,?,?,?,?,?) ON CONFLICT(old_room_id) DO NOTHING`).bind(options.oldRoomId, options.newVersion, options.actorUserId,
       JSON.stringify(additionalCreators), Date.now(), Date.now()).run();

@@ -290,6 +290,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     WHERE m.user_id=? AND m.membership='join' AND e.event_type='m.room.member' AND e.stream_ordering>?`)
     .bind(userId, sincePosition).all<{ room_id: string }>() : { results: [] };
   const newlyJoinedRooms = new Set(recentJoins.results.map(row => row.room_id));
+  const roomMetadata = new Map<string, any[]>();
   for (const roomId of joinedRoomIds) {
     // Check if room should be included based on filter
     if (!shouldIncludeRoom(roomId, filter?.room)) {
@@ -314,7 +315,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     // Old clients may have cached an empty timeline at the federation join.
     // Refresh it once when upgrading from the previous sync token format.
-    const initialTimeline = !since || !since.includes('_dk');
+    const initialTimeline = !since || !since.includes('_dk') || newlyJoinedRooms.has(roomId);
     const timelineLimit = Math.min(100, Math.max(0, filter?.room?.timeline?.limit ?? 20));
     const candidates = initialTimeline
       ? (await getRoomEvents(c.env.DB, roomId, currentPosition + 1, timelineLimit + 1, 'b')).events.reverse()
@@ -357,9 +358,30 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       timelineEvents.push(clientEvent);
     }
 
-    // Include full state if requested or initial sync
+    // Rejoined rooms need their complete bootstrap even when their create event
+    // was acknowledged while invited. Keep immutable/version metadata available
+    // to repair clients which previously cached an incomplete joined room.
+    const state = await getRoomState(c.env.DB, roomId);
+    const membership = await c.env.DB.prepare(`SELECT m.user_id, m.membership FROM room_memberships m
+      LEFT JOIN events e ON e.event_id=m.event_id AND e.room_id=m.room_id
+      WHERE m.room_id=? ORDER BY e.stream_ordering, m.user_id`)
+      .bind(roomId).all<{ user_id: string; membership: string }>();
+    const peers = membership.results.filter(member => member.user_id !== userId);
+    const activePeers = peers.filter(member => ['join', 'invite'].includes(member.membership));
+    const heroes = (activePeers.length ? activePeers : peers.filter(member => ['leave', 'ban'].includes(member.membership)))
+      .slice(0, 5).map(member => member.user_id);
+    joinedRoom.summary = {
+      'm.joined_member_count': membership.results.filter(member => member.membership === 'join').length,
+      'm.invited_member_count': membership.results.filter(member => member.membership === 'invite').length,
+    };
+    if (!state.some(event => (event.type === 'm.room.name' && event.content.name) ||
+      (event.type === 'm.room.canonical_alias' && event.content.alias))) joinedRoom.summary['m.heroes'] = heroes;
+    roomMetadata.set(roomId, applyEventFilter(state.filter(event =>
+      ['m.room.create', 'm.room.encryption', 'm.room.tombstone'].includes(event.type) ||
+      (event.type === 'm.room.member' && heroes.includes(event.state_key!))
+    ).map(event => ({ type: event.type, state_key: event.state_key, content: event.content,
+      sender: event.sender, origin_server_ts: event.origin_server_ts, event_id: event.event_id, room_id: event.room_id })), filter?.room?.state));
     if (fullState || initialTimeline || limited) {
-      const state = await getRoomState(c.env.DB, roomId);
       for (const event of state) {
         const clientEvent = {
           type: event.type,
@@ -561,6 +583,14 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     console.log('[sync] Skipping DO wait for', userId, '- hasChanges:', hasChanges,
       'roomChanges:', hasRoomChanges, 'invites:', hasInvites, 'leaves:', hasLeaves,
       'toDevice:', hasToDevice, 'accountData:', hasAccountData);
+  }
+
+  // Metadata repair must not count as activity: unchanged rooms should retain
+  // long polling rather than sending a tight loop of repeated creation events.
+  for (const [roomId, metadata] of roomMetadata) {
+    const state = response.rooms!.join![roomId].state!.events;
+    const known = new Set(state.map(event => event.event_id));
+    state.push(...metadata.filter(event => !known.has(event.event_id)));
   }
 
   // Build composite next_batch token with separate positions for each stream
