@@ -110,7 +110,9 @@ One unavoidable metadata conversion is the source's opaque backup etag to a
 native integer etag. Backup version IDs, signed auth data and all encrypted
 sessions remain unchanged. The conversion count appears in `user-import.json`.
 
-Run the focused regressions before the real Synapse rehearsal:
+Run the focused regressions before the real Synapse rehearsal. The signed HTTP
+transport tests also require PyNaCl from `requirements-federation-replay.txt`;
+the migration CI installs both requirements files:
 
 ```sh
 python -m unittest discover -s scripts/migration/auth/tests -v

@@ -41,6 +41,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                 source.execute("INSERT INTO room_state VALUES (?,?,?,?)", (self.room, kind, key, eid))
         source.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("$badleave", self.native, self.user,
             "m.room.member", self.user, '{"membership":"leave"}', 13000, None, 13, 92, None))
+        source.execute("INSERT INTO client_filters VALUES (?,?,?)", (self.user, "legacy-filter", json.dumps({"room": {"not_rooms": [self.room]}})))
         for eid, depth, pos in [("$older", 12, 80), ("$newer", 13, 141)]:
             source.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?)", (eid, self.native, self.user,
                 "m.room.encrypted", None, '{"ciphertext":"native"}', pos * 1000, None, depth, pos, None))
@@ -52,6 +53,8 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "secret").write_bytes(b"s" * 32)
         archive.STORE = archive.ArchiveStore(self.root / "source.sqlite", self.root / "manifest.json")
         self.valid = {"native-access": self.user, "other-access": "@other:example.org"}
+        self.native_filters = {(self.user, "1"): {"room": {"timeline": {"limit": 1, "types": ["m.room.encrypted"]},
+            "state": {"lazy_load_members": True, "types": ["m.room.create", "m.room.member"]}}}}
         self.calls = []
         async def upstream(request):
             self.calls.append((request.path, dict(request.query), request.headers.get("Accept-Encoding")))
@@ -60,6 +63,12 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response({"errcode": "M_UNKNOWN_TOKEN"}, status=401)
             if request.path.endswith("whoami"):
                 return web.json_response({"user_id": user, "device_id": "KEPT"})
+            if "/filter/" in request.path:
+                owner, filter_id = request.path.split("/user/", 1)[1].split("/filter/", 1)
+                if owner != user:
+                    return web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+                definition = self.native_filters.get((user, filter_id))
+                return web.json_response(definition) if definition is not None else web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
             if request.path.endswith("sync"):
                 return web.json_response({"next_batch": "s200_1_2_3_4_5_6_7_8_9", "rooms": {"join": {self.native: {"timeline": {"events": []}}}}, "to_device": {"events": [{"content": {"ciphertext": "device-original"}}]}})
             if request.path.endswith("joined_rooms"):
@@ -104,6 +113,72 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.valid["native-access"] = self.user
         response = await self.client.put("/_matrix/client/v3/rooms/" + self.room + "/state/m.room.name", json={"name": "cannot change"}, headers={"Authorization": "Bearer native-access"})
         self.assertEqual(response.status, 403)
+
+    async def test_element_numeric_saved_filter_initial_and_full_state_sync(self):
+        for params in ({}, {"since": "s200_1_2_3_4_5_6_7_8_9", "full_state": "true"}):
+            self.calls.clear()
+            response = await self.client.get("/_matrix/client/v3/sync", params={"filter": "1", "timeout": "0", **params},
+                headers={"Authorization": "Bearer native-access", "Origin": "vector://vector"})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+            body = await response.json()
+            self.assertEqual(body["next_batch"], "s200_1_2_3_4_5_6_7_8_9")
+            room = body["rooms"]["join"][self.room]
+            self.assertEqual([item["event_id"] for item in room["timeline"]["events"]], ["$cipher"])
+            self.assertEqual({item["type"] for item in room["state"]["events"]}, {"m.room.create", "m.room.member"})
+            self.assertEqual(body["to_device"]["events"][0]["content"]["ciphertext"], "device-original")
+            self.assertEqual([item[0] for item in self.calls], ["/_matrix/client/v3/account/whoami",
+                "/_matrix/client/v3/user/" + self.user + "/filter/1", "/_matrix/client/v3/sync"])
+            self.assertEqual(self.calls[-1][1]["filter"], "1")
+            self.assertEqual(self.calls[-2][2], "identity")
+
+    async def test_saved_filter_failure_returns_native_error_before_any_sync(self):
+        response = await self.get("/_matrix/client/v3/sync", filter="999")
+        self.assertEqual(response.status, 404)
+        self.assertEqual((await response.json())["errcode"], "M_NOT_FOUND")
+        self.assertFalse(any(path.endswith("/sync") for path, _, _ in self.calls))
+        self.calls.clear()
+        response = await self.get("/_matrix/client/v3/sync", filter="1", token="other-access")
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self.calls[-1][0], "/_matrix/client/v3/user/@other:example.org/filter/1")
+        self.assertFalse(any(path.endswith("/sync") for path, _, _ in self.calls))
+
+    async def test_saved_filter_room_exclusion_and_inline_json_do_not_cross(self):
+        self.native_filters[(self.user, "2")] = {"room": {"not_rooms": [self.room]}}
+        response = await self.get("/_matrix/client/v3/sync", filter="2")
+        self.assertNotIn(self.room, (await response.json())["rooms"]["join"])
+        self.calls.clear()
+        response = await self.get("/_matrix/client/v3/sync", filter=json.dumps({"room": {"timeline": {"limit": 0}}}))
+        self.assertEqual((await response.json())["rooms"]["join"][self.room]["timeline"]["events"], [])
+        self.assertFalse(any("/filter/" in path for path, _, _ in self.calls))
+
+    async def test_legacy_saved_filter_is_expanded_once_and_invalid_inline_filter_never_syncs(self):
+        response = await self.get("/_matrix/client/v3/sync", filter="legacy-filter")
+        self.assertEqual(response.status, 200)
+        self.assertNotIn(self.room, (await response.json())["rooms"]["join"])
+        self.assertFalse(any("/filter/" in path for path, _, _ in self.calls))
+        self.assertEqual(json.loads(self.calls[-1][1]["filter"]), {"room": {"not_rooms": [self.room]}})
+        for value in ('{"room":[]}', '{broken'):
+            self.calls.clear()
+            response = await self.get("/_matrix/client/v3/sync", filter=value)
+            self.assertEqual(response.status, 400)
+            self.assertFalse(any(path.endswith("/sync") for path, _, _ in self.calls))
+
+    async def test_element_origin_preflight_archive_and_native_errors_have_cors(self):
+        path = "/_matrix/client/v3/rooms/" + self.room + "/state"
+        response = await self.client.options(path, headers={"Origin": "vector://vector",
+            "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization"})
+        self.assertEqual(response.status, 204)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+        self.assertIn("Authorization", response.headers["Access-Control-Allow-Headers"])
+        self.assertEqual(self.calls, [])
+        response = await self.client.get(path, headers={"Authorization": "Bearer native-access", "Origin": "vector://vector"})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+        response = await self.client.get("/_matrix/client/v3/sync?filter=999",
+            headers={"Authorization": "Bearer native-access", "Origin": "vector://vector"})
+        self.assertEqual(response.status, 404)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
 
     async def test_pagination_state_empty_key_and_original_event_id(self):
         path = "/_matrix/client/v3/rooms/" + self.room

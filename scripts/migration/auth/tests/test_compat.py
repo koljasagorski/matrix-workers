@@ -14,6 +14,7 @@ import zlib
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from migration_auth.common import native_token, token_hash, verify_legacy_password
@@ -110,11 +111,18 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.synthetic = native_token(self.secret, token_hash("old-access"))
         self.valid_tokens = {self.synthetic, "new-native-access"}
         self.calls = []
+        self.raw_calls = []
+        self.signed_validator = None
         self.health_available = True
 
         async def upstream(request):
             body = await request.read()
             self.calls.append((request.path, list(request.query.items()), request.headers.get("Authorization"), body))
+            self.raw_calls.append((request.method, request.raw_path, request.headers.get("Authorization"), body))
+            if self.signed_validator and request.headers.get("Authorization", "").startswith("X-Matrix "):
+                if not self.signed_validator(request, body):
+                    return web.json_response({"errcode": "M_UNAUTHORIZED"}, status=401)
+                return web.json_response({"forwarded": True}, headers={"Access-Control-Allow-Origin": "*"})
             if request.path == "/_matrix/client/versions":
                 return web.json_response({"versions": ["v1.15"]}, status=200 if self.health_available else 503)
             token = request.headers.get("Authorization", "")[7:]
@@ -172,12 +180,68 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         auth = {"Authorization": "Bearer old-access"}
         self.assertEqual((await self.client.get("/_matrix/client/v3/sync?filter=0fabc123", headers=auth)).status, 200)
         self.assertEqual(json.loads(dict(self.calls[-1][1])["filter"]), {"room": {"timeline": {"limit": 20}}})
-        response = await self.client.get("/_matrix/client/v3/user/@alice:example.org/filter/0fabc123", headers=auth)
+        response = await self.client.get("/_matrix/client/v3/user/@alice:example.org/filter/0fabc123", headers={**auth, "Origin": "vector://vector"})
         self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
         self.assertEqual(await response.json(), {"room": {"timeline": {"limit": 20}}})
         self.assertEqual((await self.client.get("/_matrix/client/v3/user/@bob:example.org/filter/0fabc123", headers=auth)).status, 403)
         await self.client.post("/_matrix/client/v3/logout", headers=auth)
         self.assertEqual((await self.client.get("/_matrix/client/v3/user/@alice:example.org/filter/0fabc123", headers=auth)).status, 401)
+
+    async def test_signed_federation_preserves_raw_uri_query_authorization_and_unicode_body(self):
+        from nacl.signing import SigningKey
+        from nacl.exceptions import BadSignatureError
+        signer = SigningKey.generate()
+        origin, destination = "peer.example", "example.org"
+        def canonical(method, uri, body):
+            value = {"method": method, "uri": uri, "origin": origin, "destination": destination}
+            if body:
+                value["content"] = json.loads(body)
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        for method, uri, body in (
+            ("GET", "/_matrix/federation/v1/user/devices/%40alice%3Aexample.org?dup=%2f&dup=%2F&space=a%20b&plus=a+b&access_token=opaque-query-value", b""),
+            ("PUT", "/_matrix/federation/v1/send/txn%2fopaque?first=%3a&first=%3A", '{ "message": "Grüße 🦉", "pdus": [] }'.encode()),
+            ("POST", "/_matrix/key/v2/query/peer%3Aexample?value=%40alice%3aexample.org", '{"server_keys":{},"label":"日本語"}'.encode()),
+        ):
+            signature = signer.sign(canonical(method, uri, body)).signature
+            encoded = base64.b64encode(signature).decode().rstrip("=")
+            authorization = 'X-Matrix origin="peer.example",destination="example.org",key="ed25519:test",sig="' + encoded + '"'
+            def validate(request, forwarded):
+                if request.headers.get("Authorization") != authorization:
+                    return False
+                try:
+                    signer.verify_key.verify(canonical(request.method, request.raw_path, forwarded), signature)
+                    return True
+                except BadSignatureError:
+                    return False
+            self.signed_validator = validate
+            before = len(self.calls)
+            url = URL(str(self.client.make_url("")) + uri, encoded=True)
+            response = await self.client.session.request(method, url, data=body, headers={"Authorization": authorization, "Content-Type": "application/json"})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"forwarded": True})
+            self.assertEqual(self.raw_calls[-1], (method, uri, authorization, body))
+            self.assertEqual(len(self.calls), before + 1)
+            self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+
+    async def test_matrix_preflight_needs_no_auth_or_upstream_and_cors_covers_errors(self):
+        count = len(self.calls)
+        for path in ("/_matrix/client/v3/sync", "/_matrix/client/v3/user/@alice:example.org/filter/0fabc123", "/_matrix/client/v3/rooms/!archive:example.org/event/$event"):
+            response = await self.client.options(path, headers={"Origin": "vector://vector", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization,content-type"})
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+            self.assertIn("Authorization", response.headers["Access-Control-Allow-Headers"])
+            self.assertIn("GET", response.headers["Access-Control-Allow-Methods"])
+        self.assertEqual(len(self.calls), count)
+        response = await self.client.get("/_matrix/client/v3/sync", headers={"Origin": "vector://vector"})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
+        (self.root / "maintenance.flag").write_text("maintenance")
+        response = await self.client.options("/_matrix/client/v3/sync", headers={"Origin": "vector://vector"})
+        self.assertEqual(response.status, 204)
+        response = await self.client.get("/_matrix/client/v3/sync", headers={"Origin": "vector://vector"})
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.headers.getall("Access-Control-Allow-Origin"), ["*"])
 
     async def test_truthful_health_well_known_cors_and_private_admin(self):
         response = await self.client.get("/health")

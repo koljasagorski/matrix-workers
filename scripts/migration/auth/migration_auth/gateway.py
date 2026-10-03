@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
+from yarl import URL
 
 from .common import LEGACY_POSITION, native_token, token_hash
 
@@ -139,7 +140,26 @@ async def create_app(config):
             payload = {"m.homeserver": {"base_url": config.get("public_base_url", "https://" + server_name)}}
         return web.json_response(payload, headers=cors)
 
+    async def prepare_matrix_cors(request, response):
+        if request.path.startswith("/_matrix/"):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, POST, PUT, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "X-Requested-With, Content-Type, Authorization"
+
+    app.on_response_prepare.append(prepare_matrix_cors)
+
+    async def proxy_response(request, url, headers, body, query=None):
+        async with session.request(request.method, url, params=query, headers=headers, data=body, allow_redirects=False) as response:
+            out = web.StreamResponse(status=response.status, headers=CIMultiDict((k, v) for k, v in response.headers.items() if k.lower() not in HOP_HEADERS))
+            await out.prepare(request)
+            async for chunk in response.content.iter_chunked(65536):
+                await out.write(chunk)
+            await out.write_eof()
+            return out
+
     async def handler(request):
+        if request.method == "OPTIONS" and request.path.startswith("/_matrix/"):
+            return web.Response(status=204)
         if maintenance():
             return maintenance_response()
         # Administration is available only via the private native listener.
@@ -147,8 +167,18 @@ async def create_app(config):
         if request.path == "/admin" or request.path.startswith(("/admin/", "/_synapse/admin", "/_matrix/client/v3/admin", "/_matrix/client/r0/admin")):
             return web.json_response({"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"}, status=404)
         headers = CIMultiDict((k, v) for k, v in request.headers.items() if k.lower() not in HOP_HEADERS | {"host"})
-        query = [(k, v) for k, v in request.query.items() if k != "access_token"]
         authorization = request.headers.get("Authorization", "")
+        if request.path.startswith("/_matrix/federation/") or (
+                request.path.startswith("/_matrix/") and authorization.lower().startswith("x-matrix ")):
+            # Matrix signatures cover the original escaped URI including its raw
+            # query, plus the original JSON body. No client token/filter handling
+            # or URL canonicalization may alter these server-to-server requests.
+            body = await request.read()
+            try:
+                return await proxy_response(request, URL(upstream + request.raw_path, encoded=True), headers, body)
+            except (ClientError, ConnectionError, TimeoutError):
+                return web.json_response({"errcode": "M_UNKNOWN", "error": "Homeserver temporarily unavailable"}, status=502)
+        query = [(k, v) for k, v in request.query.items() if k != "access_token"]
         raw = authorization[7:] if authorization.lower().startswith("bearer ") else request.query.get("access_token")
         mapped_identity = None
         if raw:
@@ -195,13 +225,7 @@ async def create_app(config):
                 result = await hook(request, identity, session, upstream, headers)
                 if result is not None:
                     return result
-            async with session.request(request.method, upstream + path, params=query, headers=headers, data=body, allow_redirects=False) as response:
-                out = web.StreamResponse(status=response.status, headers=CIMultiDict((k, v) for k, v in response.headers.items() if k.lower() not in HOP_HEADERS))
-                await out.prepare(request)
-                async for chunk in response.content.iter_chunked(65536):
-                    await out.write(chunk)
-                await out.write_eof()
-                return out
+            return await proxy_response(request, upstream + path, headers, body, query)
         except (ClientError, ConnectionError, TimeoutError):
             return web.json_response({"errcode": "M_UNKNOWN", "error": "Homeserver temporarily unavailable"}, status=502)
 

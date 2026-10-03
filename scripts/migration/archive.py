@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from aiohttp import web
 
@@ -180,6 +180,34 @@ async def upstream_json(request, session, upstream_url, headers):
         return await response.json()
 
 
+async def sync_filter(value, identity, session, upstream_url, headers):
+    """Resolve owner-scoped native filter IDs before requesting any sync data.
+
+    Element creates numeric saved filters after a fresh login. Legacy filters
+    were already expanded by the gateway; inline JSON remains unchanged.
+    """
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+        if value.startswith("{"):
+            return error("M_INVALID_PARAM", "Invalid sync filter", 400)
+    if isinstance(parsed, dict):
+        return parsed
+    headers = dict(headers)
+    headers["Accept-Encoding"] = "identity"
+    path = "/_matrix/client/v3/user/" + quote(identity["user_id"], safe="") + "/filter/" + quote(value, safe="")
+    async with session.get(upstream_url + path, headers=headers) as response:
+        if response.status != 200:
+            return web.Response(status=response.status, body=await response.read(), content_type="application/json")
+        parsed = await response.json()
+        if not isinstance(parsed, dict):
+            return error("M_INVALID_PARAM", "Invalid saved sync filter", 400)
+        return parsed
+
+
 async def handle(request, identity, upstream_session, upstream_url, forwarded_headers):
     archive = store()
     path = request["compat_path"]
@@ -267,6 +295,14 @@ async def handle(request, identity, upstream_session, upstream_url, forwarded_he
     sync = path.endswith("/sync")
     if sync and "since" in query and query.get("full_state") != "true":
         return None
+    room_filter = {}
+    if sync:
+        definition = await sync_filter(query.get("filter"), identity, upstream_session, upstream_url, forwarded_headers)
+        if isinstance(definition, web.StreamResponse):
+            return definition
+        room_filter = definition.get("room", {})
+        if not isinstance(room_filter, dict):
+            return error("M_INVALID_PARAM", "Invalid room sync filter", 400)
     response = await upstream_json(request, upstream_session, upstream_url, forwarded_headers)
     if isinstance(response, web.StreamResponse):
         return response
@@ -275,10 +311,6 @@ async def handle(request, identity, upstream_session, upstream_url, forwarded_he
     if not sync:
         response["joined_rooms"] = sorted(set(response.get("joined_rooms", [])) | set(readable))
     else:
-        try:
-            room_filter = json.loads(query.get("filter", "{}" )).get("room", {})
-        except (ValueError, AttributeError):
-            return error("M_INVALID_PARAM", "Invalid sync filter", 400)
         joined = response.setdefault("rooms", {}).setdefault("join", {})
         for room_id in readable:
             if allowed(room_id, room_filter):
