@@ -4,8 +4,6 @@
 // This service provides ~95% cache hit rate for active rooms,
 // reducing sync query count by 80-90%
 
-import type { D1Database } from '@cloudflare/workers-types';
-
 // Cached room metadata structure
 export interface RoomMetadata {
   name?: string;
