@@ -1,7 +1,8 @@
 import { beforeAll, beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import backup, { EXPORT_BINDINGS } from '../src/api/migration-backup';
-import { migrationExport } from '../src/durable-objects/migration-export';
+import { migrationExport, encodeStoredValue } from '../src/durable-objects/migration-export';
+import { decodeStoredValue } from '../scripts/migration/stored-values.mjs';
 import { migrationFreeze } from '../src/middleware/migration-freeze';
 import { testEnv } from './federation-helpers';
 import { hashPassword } from '../src/utils/crypto';
@@ -77,7 +78,7 @@ it('exports all raw keys through bounded pages, including E2EE values absent fro
     const page = await response.json() as any;
     expect(page.entries.length).toBeLessThanOrEqual(8);
     expect(page.alarm).toBe(1234);
-    for (const [key, value] of page.entries) { expect(restored.has(key)).toBe(false); restored.set(key, value); }
+    for (const [key, value] of page.entries) { expect(restored.has(key)).toBe(false); restored.set(key, decodeStoredValue(value)); }
     cursor = page.next_cursor ?? undefined;
   } while (cursor !== undefined);
   expect(restored).toEqual(data);
@@ -85,10 +86,45 @@ it('exports all raw keys through bounded pages, including E2EE values absent fro
   expect(state.storage.delete).not.toHaveBeenCalled();
 });
 
-it('refuses write methods and non-JSON structured values without a misleading lossy backup', async () => {
+it('refuses write methods and losslessly exports binary storage values', async () => {
   const state = stateFor(new Map([['binary', new Uint8Array([1, 2])]]));
   expect((await migrationExport(new Request('http://internal/migration-export', { method: 'POST' }), state as any)).status).toBe(405);
-  await expect(migrationExport(new Request('http://internal/migration-export'), state as any)).rejects.toThrow('typed storage');
+  const page = await (await migrationExport(new Request('http://internal/migration-export'), state as any)).json() as any;
+  expect(decodeStoredValue(page.entries[0][1])).toEqual(new Uint8Array([1, 2]));
+});
+
+it('preserves real receipt optional undefined fields, tag collisions, numeric edge cases and object references', () => {
+  const receipt = { user_id: '@user:server', thread_id: undefined, type: 'reference', id: 1, value: NaN, bytes: new Uint16Array([1000, 2000]) };
+  const value: any = { receipt, again: receipt, map: new Map(), sparse: new Array(2), infinity: Infinity, negativeZero: -0, integer: 12345678901234567890n };
+  value.map.set(value, receipt);
+  value.self = value;
+  value.sparse[1] = undefined;
+  const encoded = JSON.parse(JSON.stringify(encodeStoredValue(value)));
+  const restored = decodeStoredValue(encoded);
+  expect(restored.receipt).toEqual(receipt);
+  expect(Object.hasOwn(restored.receipt, 'thread_id')).toBe(true);
+  expect(restored.again).toBe(restored.receipt);
+  expect(restored.self).toBe(restored);
+  expect(restored.map.get(restored)).toBe(restored.receipt);
+  expect(0 in restored.sparse).toBe(false);
+  expect(1 in restored.sparse).toBe(true);
+  expect(restored.infinity).toBe(Infinity);
+  expect(Object.is(restored.negativeZero, -0)).toBe(true);
+  expect(restored.integer).toBe(value.integer);
+});
+
+it('preserves shared binary backing buffers, view offsets and lengths', () => {
+  const buffer = new ArrayBuffer(16);
+  const first = new Uint16Array(buffer, 2, 3);
+  first.set([10, 20, 30]);
+  const source = { first, second: new DataView(buffer, 4, 4), buffer };
+  const restored = decodeStoredValue(JSON.parse(JSON.stringify(encodeStoredValue(source))));
+  expect(restored.first).toEqual(first);
+  expect(restored.first.buffer).toBe(restored.buffer);
+  expect(restored.second.buffer).toBe(restored.buffer);
+  expect(restored.first.byteOffset).toBe(2);
+  expect(restored.second.byteOffset).toBe(4);
+  expect(restored.second.byteLength).toBe(4);
 });
 
 it('holds federation alarm delivery without deleting queued encrypted messages while frozen', async () => {
