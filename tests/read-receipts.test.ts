@@ -13,6 +13,7 @@ vi.mock('cloudflare:workers', () => ({ DurableObject: class {
 import { RoomDurableObject } from '../src/durable-objects/RoomDurableObject';
 import { SyncDurableObject } from '../src/durable-objects/SyncDurableObject';
 import { isServerAllowedInRoom } from '../src/services/server-acl';
+import { accountDataPosition } from '../src/services/account-data-stream';
 
 let ctx: Awaited<ReturnType<typeof testEnv>>;
 let fixture: Awaited<ReturnType<typeof roomFixture>>;
@@ -110,7 +111,52 @@ it('publishes the public receipt from read_markers and keeps the private receipt
   const response = await receipts.request(`/_matrix/client/v3/rooms/${encodeURIComponent(room)}/read_markers`, {
     method: 'POST', headers, body: JSON.stringify({ 'm.fully_read': '$message', 'm.read': '$message', 'm.read.private': '$message' }),
   }, ctx.env);
-  expect(response.status).toBe(200); expect(queued).toHaveLength(1); expect(wakeCalls).toBe(2);
+  expect(response.status).toBe(200); expect(queued).toHaveLength(1); expect(wakeCalls).toBe(3);
+});
+
+it('streams fully-read markers independently and includes a marker received during a classic long poll', async () => {
+  onWait = async () => { expect((await send('m.fully_read')).status).toBe(200); };
+  const response = await sync.request('/_matrix/client/v3/sync?since=s1_td0_dk0&timeout=25000', { headers }, ctx.env);
+  const data = await response.json();
+  expect(waitCalls).toBe(1); expect(wakeCalls).toBe(1);
+  expect(data.rooms.join[room].account_data.events).toEqual([{ type: 'm.fully_read', content: { event_id: '$message' } }]);
+  expect(data.next_batch).toBe('s1_td0_dk0_ad1');
+  expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+  expect(await receiptPosition(ctx.env.DB)).toBe(0); expect(queued).toEqual([]);
+  onWait = undefined;
+  const next = await (await sync.request('/_matrix/client/v3/sync?since=' + data.next_batch, { headers }, ctx.env)).json();
+  expect(next.rooms.join[room].account_data.events).toEqual([]);
+});
+
+it('logs automatic main-timeline read markers once and retries wakes without duplicate account-data changes', async () => {
+  expect((await send('m.read')).status).toBe(200);
+  expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+  expect(wakeCalls).toBe(2);
+  expect((await send('m.fully_read')).status).toBe(200);
+  expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+  expect(wakeCalls).toBe(3);
+  expect(ctx.sqlite.prepare("SELECT count(*) AS n FROM account_data_changes WHERE event_type='m.fully_read'").get()).toEqual({ n: 1 });
+  ctx.sqlite.prepare(`INSERT INTO events(event_id,room_id,sender,event_type,content,origin_server_ts,depth,auth_events,prev_events,stream_ordering)
+    VALUES ('$second',?,?,'m.room.message','{}',2,2,'[]','["$message"]',2)`).run(room, user);
+  const response = await receipts.request(`/_matrix/client/v3/rooms/${encodeURIComponent(room)}/read_markers`, {
+    method: 'POST', headers, body: JSON.stringify({ 'm.read': '$second' }),
+  }, ctx.env);
+  expect(response.status).toBe(200); expect(await accountDataPosition(ctx.env.DB)).toBe(2);
+  expect(ctx.sqlite.prepare("SELECT content FROM account_data WHERE user_id=? AND room_id=? AND event_type='m.fully_read'").get(user, room))
+    .toEqual({ content: '{"event_id":"$second"}' });
+});
+
+it('rolls back fully-read content and its cursor together if change-log insertion fails, then repairs on retry', async () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  ctx.sqlite.exec("CREATE TRIGGER reject_marker_log BEFORE INSERT ON account_data_changes BEGIN SELECT RAISE(ABORT,'Temporary marker log failure'); END;");
+  expect((await send('m.fully_read')).status).toBe(500);
+  expect(await accountDataPosition(ctx.env.DB)).toBe(0);
+  expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM account_data').get()).toEqual({ n: 0 });
+  expect(wakeCalls).toBe(0);
+  ctx.sqlite.exec('DROP TRIGGER reject_marker_log');
+  expect((await send('m.fully_read')).status).toBe(200);
+  expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+  error.mockRestore();
 });
 
 it('ignores stale receipts and spoofed users, private EDUs and receipts from non-members', async () => {

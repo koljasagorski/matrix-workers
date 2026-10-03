@@ -3,12 +3,27 @@ updates:
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
+      time: '05:23'
+      timezone: Europe/Berlin
+    open-pull-requests-limit: 10
     groups:
-      development:
-        dependency-type: development
+      compatible-version-updates:
+        applies-to: version-updates
+        patterns: ['*']
+        update-types: [minor, patch]
+      compatible-security-updates:
+        applies-to: security-updates
+        patterns: ['*']
         update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
+      time: '05:37'
+      timezone: Europe/Berlin
+    open-pull-requests-limit: 10
+    groups:
+      compatible-action-updates:
+        patterns: ['*']
+        update-types: [minor, patch]

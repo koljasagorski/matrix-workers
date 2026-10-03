@@ -12,6 +12,7 @@ import { parseSyncPosition, deviceKeyPosition, changedDeviceUsers } from '../ser
 import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
 import { receiptPosition } from '../services/read-receipts';
+import { accountDataPosition } from '../services/account-data-stream';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
@@ -1386,6 +1387,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   const currentStreamPos = await getCurrentStreamPosition(db);
   let currentKeys = await deviceKeyPosition(db);
   let currentReceipts = await receiptPosition(db);
+  let currentAccountData = body.extensions?.account_data ? await accountDataPosition(db) : 0;
 
   // Get or create connection state
   let connectionState: ConnectionState | null;
@@ -1844,7 +1846,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Always advance position to prevent client re-sync loops
   // Previously we only set pos when hasChanges, but this caused clients to receive
   // the same pos twice and immediately re-sync, thinking it was stale
-  response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}`;
+  response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}${currentAccountData ? `_ad${currentAccountData}` : ''}`;
   connectionState.pos = currentStreamPos;
 
   // Mark initial sync as complete so ephemeral fallback doesn't run again on reconnects
@@ -1869,9 +1871,13 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
 
   // Verification and encryption-key messages are changes even when no room
   // timeline changed. Never hold a ready device message for the poll timeout.
+  const ownAccountDataChanged = response.extensions.account_data && currentAccountData > parseSyncPosition(posToken).accountData
+    ? await db.prepare('SELECT 1 FROM account_data_changes WHERE user_id=? AND stream_position>? AND stream_position<=? LIMIT 1')
+      .bind(userId, parseSyncPosition(posToken).accountData, currentAccountData).first() : null;
   hasChanges ||= (response.extensions.to_device?.events.length ?? 0) > 0 ||
     (response.extensions.e2ee?.device_lists?.changed.length ?? 0) > 0 ||
-    (!!response.extensions.receipts && currentReceipts > parseSyncPosition(posToken).receipts);
+    (!!response.extensions.receipts && currentReceipts > parseSyncPosition(posToken).receipts) ||
+    !!ownAccountDataChanged;
 
   // Long-polling: if no changes and timeout > 0, wait for events via Durable Object
   // The SyncDurableObject will wake us up when events arrive for this user
@@ -1886,7 +1892,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ timeout, userId, deviceId: body.extensions?.to_device ? c.get('deviceId') : undefined,
           toDeviceSince: body.extensions?.to_device?.since,
-          receiptsSince: response.extensions.receipts ? currentReceipts : undefined }),
+          receiptsSince: response.extensions.receipts ? currentReceipts : undefined,
+          accountDataSince: response.extensions.account_data ? currentAccountData : undefined }),
       }));
       const waitResult = await waitResponse.json() as { hasEvents: boolean };
 
@@ -1908,7 +1915,21 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
           response.extensions.receipts = { rooms: Object.fromEntries(Object.entries(receipts)
             .map(([roomId, content]) => [roomId, { type: 'm.receipt', content }])) };
         }
-        response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}`;
+        if (response.extensions.account_data) {
+          currentAccountData = await accountDataPosition(db);
+          const { getGlobalAccountData, getRoomAccountData, getE2EEAccountDataFromDO } = await import('./account-data');
+          const global = Object.fromEntries((await getGlobalAccountData(db, userId)).map(event => [event.type, event.content]));
+          try { Object.assign(global, await getE2EEAccountDataFromDO(c.env, userId)); } catch { /* D1 remains available */ }
+          const joined = await db.prepare("SELECT room_id FROM room_memberships WHERE user_id=? AND membership='join'")
+            .bind(userId).all<{ room_id: string }>();
+          const rooms: Record<string, { type: string; content: any }[]> = {};
+          for (const { room_id: roomId } of joined.results) {
+            const data = await getRoomAccountData(db, userId, roomId);
+            if (data.length) rooms[roomId] = data;
+          }
+          response.extensions.account_data = { global: Object.entries(global).map(([type, content]) => ({ type, content })), rooms };
+        }
+        response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}${currentAccountData ? `_ad${currentAccountData}` : ''}`;
       } else {
         console.log('[sliding-sync] Wait timed out, no new events');
       }

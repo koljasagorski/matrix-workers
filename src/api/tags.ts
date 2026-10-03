@@ -8,6 +8,8 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { mergeAccountData, notifyAccountDataUser } from '../services/account-data-stream';
+import { isObject } from '../services/federation-events';
 
 const app = new Hono<AppEnv>();
 
@@ -84,32 +86,12 @@ app.put('/_matrix/client/v3/user/:userId/rooms/:roomId/tags/:tag', requireAuth()
     // Body is optional
   }
 
-  // Get existing tags
-  const existing = await db.prepare(`
-    SELECT content FROM account_data
-    WHERE user_id = ? AND room_id = ? AND event_type = 'm.tag'
-  `).bind(requestingUserId, roomId).first<{ content: string }>();
-
-  let tags: Record<string, Record<string, any>> = {};
-  if (existing) {
-    try {
-      const content = JSON.parse(existing.content);
-      tags = content.tags || {};
-    } catch {
-      // Start fresh
-    }
-  }
-
-  // Add/update the tag
-  tags[tag] = tagContent;
-
-  // Store updated tags
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, ?, 'm.tag', ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(requestingUserId, roomId, JSON.stringify({ tags })).run();
+  await mergeAccountData(db, requestingUserId, roomId, 'm.tag', current => {
+    let tags: Record<string, unknown> = {};
+    try { const value = JSON.parse(current ?? '{}'); if (isObject(value) && isObject(value.tags)) tags = value.tags; } catch { /* start fresh */ }
+    return { tags: { ...tags, [tag]: tagContent } };
+  });
+  await notifyAccountDataUser(c.env, requestingUserId);
 
   return c.json({});
 });
@@ -127,35 +109,15 @@ app.delete('/_matrix/client/v3/user/:userId/rooms/:roomId/tags/:tag', requireAut
     return Errors.forbidden('Cannot delete tags for other users').toResponse();
   }
 
-  // Get existing tags
-  const existing = await db.prepare(`
-    SELECT content FROM account_data
-    WHERE user_id = ? AND room_id = ? AND event_type = 'm.tag'
-  `).bind(requestingUserId, roomId).first<{ content: string }>();
-
-  if (!existing) {
-    // No tags to delete, that's fine
-    return c.json({});
-  }
-
-  let tags: Record<string, Record<string, any>> = {};
-  try {
-    const content = JSON.parse(existing.content);
-    tags = content.tags || {};
-  } catch {
-    return c.json({});
-  }
-
-  // Remove the tag
-  delete tags[tag];
-
-  // Store updated tags
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, ?, 'm.tag', ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(requestingUserId, roomId, JSON.stringify({ tags })).run();
+  await mergeAccountData(db, requestingUserId, roomId, 'm.tag', current => {
+    try {
+      const value = JSON.parse(current ?? '{}');
+      if (!isObject(value) || !isObject(value.tags)) return undefined;
+      const tags = { ...value.tags }; delete tags[tag];
+      return { tags };
+    } catch { return undefined; }
+  });
+  await notifyAccountDataUser(c.env, requestingUserId);
 
   return c.json({});
 });

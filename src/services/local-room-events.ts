@@ -11,7 +11,7 @@ import { readFederationJson } from './federation-http';
 import { invalidateRoomCache } from './room-cache';
 import { prepareRestrictedJoinContent } from './restricted-joins';
 
-interface LocalEventInput {
+export interface LocalEventInput {
   roomId: string;
   sender: string;
   type: string;
@@ -55,11 +55,24 @@ export async function buildLocalRoomEvent(env: Env, input: LocalEventInput, init
   const latest = input.type === 'm.room.create' ? null : await env.DB.prepare(
     'SELECT event_id,depth FROM events WHERE room_id=? ORDER BY depth DESC,stream_ordering DESC LIMIT 1'
   ).bind(input.roomId).first<{ event_id: string; depth: number }>();
+  return { version, event: await buildLocalRoomEventFromState(env, input, version, state, latest ?? undefined) };
+}
+
+// Build a bootstrap graph in memory so its complete, authorized state can be
+// committed together. The caller supplies the actual state before this event.
+export async function buildLocalRoomEventFromState(
+  env: Env, input: LocalEventInput, version: string, state: PDU[],
+  previous?: { event_id: string; depth: number },
+): Promise<PDU> {
+  if (parseUserId(input.sender)?.serverName !== env.SERVER_NAME) throw Errors.forbidden('Invalid local sender');
+  if (!FEDERATED_ROOM_VERSIONS.includes(version)) throw Errors.unsupportedRoomVersion();
+  if (!isObject(input.content)) throw Errors.badJson('Event content must be an object');
+  if (state.some(event => event.room_id !== input.roomId)) throw Errors.invalidRoomState('Bootstrap state belongs to another room');
   const event: PDU = {
     event_id: '', room_id: input.roomId, sender: input.sender, type: input.type,
     content: input.content, ...(input.stateKey === undefined ? {} : { state_key: input.stateKey }),
-    origin_server_ts: Date.now(), depth: Math.min((latest?.depth ?? 0) + 1, Number.MAX_SAFE_INTEGER),
-    auth_events: selectAuthEvents(state, input, version), prev_events: latest ? [latest.event_id] : [],
+    origin_server_ts: Date.now(), depth: Math.min((previous?.depth ?? 0) + 1, Number.MAX_SAFE_INTEGER),
+    auth_events: selectAuthEvents(state, input, version), prev_events: previous ? [previous.event_id] : [],
     ...(input.redacts ? { redacts: input.redacts } : {}),
   };
   const authorization = checkEventAuth(event, state, version);
@@ -68,8 +81,8 @@ export async function buildLocalRoomEvent(env: Env, input: LocalEventInput, init
   if (!key) throw new Error('Server signing key unavailable');
   const signed = await signEvent(wireEvent(event, version), version, env.SERVER_NAME, key);
   if (new TextEncoder().encode(canonicalJson(signed)).length > 65536) throw Errors.tooLarge('Event exceeds 64 KiB');
-  return { version, event: { ...signed, room_id: input.roomId, event_id: await eventReferenceId(signed, version),
-    ...(input.unsigned ? { unsigned: input.unsigned } : {}) } as PDU };
+  return { ...signed, room_id: input.roomId, event_id: await eventReferenceId(signed, version),
+    ...(input.unsigned ? { unsigned: input.unsigned } : {}) } as PDU;
 }
 
 async function remoteJson(response: Response): Promise<Record<string, unknown>> {
@@ -83,7 +96,7 @@ async function remoteJson(response: Response): Promise<Record<string, unknown>> 
   return body;
 }
 
-async function countersignRemoteInvite(env: Env, event: PDU, version: string): Promise<PDU> {
+export async function countersignLocalRoomInvite(env: Env, event: PDU, version: string): Promise<PDU> {
   const destination = parseUserId(event.state_key ?? '')?.serverName;
   if (!destination) throw Errors.invalidParam('state_key');
   if (destination === env.SERVER_NAME) {
@@ -154,7 +167,7 @@ export async function persistLocalRoomEvent(env: Env, event: PDU, version: strin
 export async function sendLocalRoomEvent(env: Env, input: LocalEventInput): Promise<PDU> {
   const built = await buildLocalRoomEvent(env, input);
   const event = input.type === 'm.room.member' && input.content.membership === 'invite'
-    ? await countersignRemoteInvite(env, built.event, built.version) : built.event;
+    ? await countersignLocalRoomInvite(env, built.event, built.version) : built.event;
   await persistLocalRoomEvent(env, event, built.version);
   return event;
 }

@@ -257,8 +257,16 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
 }
 
 // Event operations
-export async function storeEvent(db: D1Database, event: PDU, relatedStatements: D1PreparedStatement[] = []): Promise<number> {
-  const snapshot = await prepareEventStateSnapshot(db, event);
+export async function prepareStoreEventStatements(
+  db: D1Database, event: PDU, relatedStatements: D1PreparedStatement[] = [], stateBefore?: PDU[],
+): Promise<D1PreparedStatement[]> {
+  const snapshot = stateBefore === undefined ? await prepareEventStateSnapshot(db, event) : db.prepare(
+    `INSERT INTO event_state_snapshots(event_id,room_id,state_before,created_at) VALUES(?,?,?,?)
+     ON CONFLICT(event_id) DO NOTHING`
+  ).bind(event.event_id, event.room_id, JSON.stringify(stateBefore.map(state => {
+    if (state.room_id !== event.room_id || state.state_key === undefined) throw new Error('Invalid bootstrap state snapshot');
+    return [state.type, state.state_key, state.event_id];
+  })), Date.now());
   // Allocate the position inside the INSERT: separate reads can give concurrent
   // events the same position and make a later /sync permanently skip one of them.
   const statements = [db.prepare(
@@ -296,6 +304,11 @@ export async function storeEvent(db: D1Database, event: PDU, relatedStatements: 
   }
 
   statements.push(...relatedStatements);
+  return statements;
+}
+
+export async function storeEvent(db: D1Database, event: PDU, relatedStatements: D1PreparedStatement[] = []): Promise<number> {
+  const statements = await prepareStoreEventStatements(db, event, relatedStatements);
   const results = await db.batch<{ stream_ordering: number }>(statements);
   return results[0].results[0].stream_ordering;
 }

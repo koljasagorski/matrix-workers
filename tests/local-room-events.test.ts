@@ -9,6 +9,7 @@ import { eventReferenceId, signEvent, wireEvent, type WireEvent } from '../src/s
 import { checkEventAuth } from '../src/services/event-auth';
 import { receiveRemoteInvite } from '../src/services/remote-invites';
 import { roomFixture, testEnv } from './federation-helpers';
+import { accountDataPosition } from '../src/services/account-data-stream';
 
 const alice = '@alice:local.example';
 const bob = '@bob:local.example';
@@ -212,6 +213,16 @@ describe('authorized signed local room events', () => {
   it('creates signed v12 replacement state and a federated tombstone during an upgrade', async () => {
     const old = await create('10', { name: 'Before upgrade', initial_state: [{ type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } }] });
     await addRemoteResident(old, '10'); queued = [];
+    const key = await generateSigningKeyPair();
+    await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
+    ctx.sqlite.prepare(`INSERT INTO remote_server_keys(server_name,key_id,public_key,valid_from,valid_until,fetched_at,verified)
+      VALUES('remote.example',?,?,?,?,?,1)`).run(key.keyId, key.publicKey, Date.now() - 1000, Date.now() + 86400000, Date.now());
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { event: WireEvent };
+      const signed = await signJson({ ...peerSigningEvent(body.event, '12'), signatures: body.event.signatures },
+        'remote.example', key.keyId, key.privateKeyJwk);
+      return Response.json({ event: { ...body.event, signatures: signed.signatures } });
+    }));
     const response = await request(roomPath(old, 'upgrade'), 'POST', { new_version: '12' });
     expect(response.status).toBe(200);
     const { replacement_room: replacement } = await response.json() as { replacement_room: string };
@@ -227,11 +238,32 @@ describe('authorized signed local room events', () => {
     expect(await (await request(roomPath(old, 'upgrade'), 'POST', { new_version: '12' })).json()).toEqual({ replacement_room: replacement });
   });
 
-  it('accepts a sync token with receipt progress for backwards room pagination', async () => {
+  it('accepts a sync token with receipt and account-data progress for backwards room pagination', async () => {
     const roomId = await create();
-    const response = await request(`${roomPath(roomId, 'messages')}?from=s100_td0_dk0_rr1&dir=b&limit=1`, 'GET');
+    const response = await request(`${roomPath(roomId, 'messages')}?from=s100_td0_dk0_rr1_ad1&dir=b&limit=1`, 'GET');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ start: 's100_td0_dk0_rr1', chunk: expect.any(Array) });
+    expect(await response.json()).toMatchObject({ start: 's100_td0_dk0_rr1_ad1', chunk: expect.any(Array) });
+  });
+
+  it('publishes the new creator read marker in the independent account-data stream and wakes sync', async () => {
+    const roomId = await create();
+    expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+    const created = (await getRoomState(ctx.env.DB, roomId)).find(event => event.type === 'm.room.create')!;
+    expect(ctx.sqlite.prepare("SELECT content FROM account_data WHERE user_id=? AND room_id=? AND event_type='m.fully_read'").get(alice, roomId))
+      .toEqual({ content: JSON.stringify({ event_id: created.event_id }) });
+    expect(ctx.sqlite.prepare('SELECT user_id,room_id,event_type,stream_position FROM account_data_changes').all())
+      .toEqual([{ user_id: alice, room_id: roomId, event_type: 'm.fully_read', stream_position: 1 }]);
+    expect(notified).toContain(alice);
+  });
+
+  it('retains an already published room and logged read marker when its account-data notification fails', async () => {
+    const get = ctx.env.SYNC.get;
+    ctx.env.SYNC.get = ((id: DurableObjectId) => ({ fetch: async (input: Request) => new URL(input.url).pathname === '/notify-device'
+      ? new Response('Unavailable', { status: 503 }) : get(id).fetch(input) })) as typeof ctx.env.SYNC.get;
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const roomId = await create();
+    expect(await accountDataPosition(ctx.env.DB)).toBe(1);
+    expect((await getRoomState(ctx.env.DB, roomId)).find(event => event.type === 'm.room.member' && event.state_key === alice)?.content.membership).toBe('join');
   });
 
   it.each(['10', '11', '12'])('uses signed replayable redactions and idempotent transactions in version %s', async version => {

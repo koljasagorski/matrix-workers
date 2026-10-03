@@ -13,6 +13,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { publishReadReceipt } from '../services/read-receipts';
 import { isObject } from '../services/federation-events';
+import { publishAccountData } from '../services/account-data-stream';
 
 const app = new Hono<AppEnv>();
 
@@ -78,12 +79,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
   // m.fully_read is special - it's room account data, not an ephemeral receipt
   // Store it in account_data table so it's returned in account_data extension
   if (receiptType === 'm.fully_read') {
-    await db.prepare(`
-      INSERT INTO account_data (user_id, room_id, event_type, content)
-      VALUES (?, ?, 'm.fully_read', ?)
-      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-        content = excluded.content
-    `).bind(userId, roomId, JSON.stringify({ event_id: eventId })).run();
+    await publishAccountData(c.env, userId, roomId, 'm.fully_read', { event_id: eventId });
     console.log('[receipts] Stored m.fully_read in account_data for', userId, 'in room', roomId, 'event', eventId);
   } else {
     // Store m.read and m.read.private in Room Durable Object
@@ -94,12 +90,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     // Also update m.fully_read when m.read is set - Element X uses m.fully_read for unread counts
     // This keeps the read marker in sync with the read receipt
     if (receiptType === 'm.read' && threadId === undefined) {
-      await db.prepare(`
-        INSERT INTO account_data (user_id, room_id, event_type, content)
-        VALUES (?, ?, 'm.fully_read', ?)
-        ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-          content = excluded.content
-      `).bind(userId, roomId, JSON.stringify({ event_id: eventId })).run();
+      await publishAccountData(c.env, userId, roomId, 'm.fully_read', { event_id: eventId });
       console.log('[receipts] Also updated m.fully_read in account_data for', userId, 'in room', roomId);
     }
   }
@@ -152,12 +143,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 
   // Process m.fully_read (stored in account data for unread counts)
   if (body['m.fully_read']) {
-    await db.prepare(`
-      INSERT INTO account_data (user_id, room_id, event_type, content)
-      VALUES (?, ?, 'm.fully_read', ?)
-      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-        content = excluded.content
-    `).bind(userId, roomId, JSON.stringify({ event_id: body['m.fully_read'] })).run();
+    await publishAccountData(c.env, userId, roomId, 'm.fully_read', { event_id: body['m.fully_read'] });
     console.log('[receipts] Stored m.fully_read in account_data for', userId, 'in room', roomId);
   }
 
@@ -168,12 +154,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
     // If m.fully_read wasn't explicitly provided, also update it to match m.read
     // This keeps unread counts in sync for clients that only send m.read
     if (!body['m.fully_read']) {
-      await db.prepare(`
-        INSERT INTO account_data (user_id, room_id, event_type, content)
-        VALUES (?, ?, 'm.fully_read', ?)
-        ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-          content = excluded.content
-      `).bind(userId, roomId, JSON.stringify({ event_id: body['m.read'] })).run();
+      await publishAccountData(c.env, userId, roomId, 'm.fully_read', { event_id: body['m.read'] });
       console.log('[receipts] Auto-updated m.fully_read to match m.read for', userId, 'in room', roomId);
     }
   }

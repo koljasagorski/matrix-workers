@@ -18,6 +18,7 @@ import {
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { receiptPosition } from '../services/read-receipts';
+import { accountDataPosition } from '../services/account-data-stream';
 import { getTypingUsers } from './typing';
 import { getStoredInviteState } from '../services/remote-invites';
 import { initialRoomHistory } from '../services/sync-history';
@@ -199,12 +200,16 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Parse composite sync token (separate positions for events and to-device)
-  const { events: sincePosition, toDevice: sinceToDevice, keys: sinceKeys, receipts: sinceReceipts } = parseSyncPosition(since);
+  const { events: sincePosition, toDevice: sinceToDevice, keys: sinceKeys, receipts: sinceReceipts, accountData: sinceAccountData } = parseSyncPosition(since);
 
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
   let currentKeys = await deviceKeyPosition(c.env.DB);
   let currentReceipts = await receiptPosition(c.env.DB);
+  let currentAccountData = await accountDataPosition(c.env.DB);
+  // Older tokens have no account-data cursor. Once this stream is populated,
+  // send its full snapshot once, including rows predating the change log.
+  const accountDataSince = () => !since || (!/_ad\d+$/.test(since) && currentAccountData > 0) ? undefined : sinceAccountData;
 
   // Track to-device position for next_batch
   let currentToDevicePos = sinceToDevice;
@@ -266,7 +271,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   let globalAccountData = await getGlobalAccountData(
     c.env.DB,
     userId,
-    sincePosition > 0 ? sincePosition : undefined
+    accountDataSince()
   );
   // Apply account_data filter to global account data
   globalAccountData = applyEventFilter(globalAccountData, filter?.account_data);
@@ -280,6 +285,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Get user's joined rooms
   const joinedRoomIds = await getUserRooms(c.env.DB, userId, 'join');
+  const recentJoins = since ? await c.env.DB.prepare(`SELECT m.room_id FROM room_memberships m
+    JOIN events e ON e.event_id=m.event_id AND e.room_id=m.room_id
+    WHERE m.user_id=? AND m.membership='join' AND e.event_type='m.room.member' AND e.stream_ordering>?`)
+    .bind(userId, sincePosition).all<{ room_id: string }>() : { results: [] };
+  const newlyJoinedRooms = new Set(recentJoins.results.map(row => row.room_id));
   for (const roomId of joinedRoomIds) {
     // Check if room should be included based on filter
     if (!shouldIncludeRoom(roomId, filter?.room)) {
@@ -381,7 +391,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       c.env.DB,
       userId,
       roomId,
-      sincePosition > 0 ? sincePosition : undefined
+      // Invites/upgrades can store preferences before the user joins. Their AD
+      // cursor may already be acknowledged, but the room's first joined sync
+      // still needs the complete settings, including after a long-poll join.
+      newlyJoinedRooms.has(roomId) ? undefined : accountDataSince()
     );
     // Apply account_data filter to room account data
     roomAccountData = applyEventFilter(roomAccountData, filter?.room?.account_data);
@@ -491,7 +504,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const hasInvites = Object.keys(response.rooms!.invite!).length > 0;
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;
   const hasToDevice = response.to_device!.events.length > 0;
-  const hasAccountData = response.account_data!.events.length > 0;
+  const hasAccountData = response.account_data!.events.length > 0 || Object.values(response.rooms!.join!)
+    .some(room => (room.account_data?.events.length ?? 0) > 0);
   const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData || keyChanges.length > 0 || currentReceipts > sinceReceipts;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
@@ -509,7 +523,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeout: waitTimeout, userId, deviceId, toDeviceSince: String(sinceToDevice), receiptsSince: currentReceipts }),
+      body: JSON.stringify({ timeout: waitTimeout, userId, deviceId, toDeviceSince: String(sinceToDevice), receiptsSince: currentReceipts,
+        accountDataSince: currentAccountData }),
     }));
 
     const waitResult = await waitResponse.json() as { hasEvents: boolean };
@@ -526,7 +541,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       // Capture the receipt cursor before reading content so a concurrent update
       // can be replayed, but never acknowledged without being returned.
       currentReceipts = await receiptPosition(c.env.DB);
+      currentAccountData = await accountDataPosition(c.env.DB);
+      response.account_data!.events = applyEventFilter(await getGlobalAccountData(c.env.DB, userId, accountDataSince()), filter?.account_data);
       for (const roomId of Object.keys(response.rooms!.join!)) {
+        response.rooms!.join![roomId].account_data!.events = applyEventFilter(
+          await getRoomAccountData(c.env.DB, userId, roomId, accountDataSince()), filter?.room?.account_data);
         const ephemeral = response.rooms!.join![roomId].ephemeral!;
         ephemeral.events = ephemeral.events.filter(event => event.type !== 'm.receipt');
         const receipts = await getReceiptsForRoom(c.env, roomId, userId);
@@ -546,7 +565,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Build composite next_batch token with separate positions for each stream
   if (!response.next_batch) {
-  response.next_batch = syncPosition(currentPosition, currentToDevicePos, currentKeys, currentReceipts);
+    response.next_batch = syncPosition(currentPosition, currentToDevicePos, currentKeys, currentReceipts, currentAccountData);
   }
 
   return c.json(response);

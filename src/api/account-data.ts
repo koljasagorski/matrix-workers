@@ -17,6 +17,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { accountDataPosition, publishAccountData } from '../services/account-data-stream';
 
 const app = new Hono<AppEnv>();
 
@@ -62,32 +63,6 @@ async function putE2EEAccountDataToDO(env: Env, userId: string, eventType: strin
 // ============================================
 // Helper Functions
 // ============================================
-
-async function getNextStreamPosition(db: D1Database, streamName: string): Promise<number> {
-  await db.prepare(`
-    UPDATE stream_positions SET position = position + 1 WHERE stream_name = ?
-  `).bind(streamName).run();
-
-  const result = await db.prepare(`
-    SELECT position FROM stream_positions WHERE stream_name = ?
-  `).bind(streamName).first<{ position: number }>();
-
-  return result?.position || 1;
-}
-
-async function recordAccountDataChange(
-  db: D1Database,
-  userId: string,
-  roomId: string,
-  eventType: string
-): Promise<void> {
-  const streamPosition = await getNextStreamPosition(db, 'account_data');
-
-  await db.prepare(`
-    INSERT INTO account_data_changes (user_id, room_id, event_type, stream_position)
-    VALUES (?, ?, ?, ?)
-  `).bind(userId, roomId, eventType, streamPosition).run();
-}
 
 // ============================================
 // Global Account Data
@@ -165,7 +140,6 @@ app.put('/_matrix/client/v3/user/:userId/account_data/:type', requireAuth(), asy
   const requestingUserId = c.get('userId');
   const targetUserId = decodeURIComponent(c.req.param('userId'));
   const eventType = decodeURIComponent(c.req.param('type'));
-  const db = c.env.DB;
 
   // Users can only modify their own account data
   if (requestingUserId !== targetUserId) {
@@ -235,16 +209,7 @@ app.put('/_matrix/client/v3/user/:userId/account_data/:type', requireAuth(), asy
     );
   }
 
-  // Also store in D1 as backup
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, '', ?, ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(targetUserId, eventType, JSON.stringify(content)).run();
-
-  // Record change for sync
-  await recordAccountDataChange(db, targetUserId, '', eventType);
+  await publishAccountData(c.env, targetUserId, '', eventType, content);
 
   return c.json({});
 });
@@ -337,16 +302,7 @@ app.put('/_matrix/client/v3/user/:userId/rooms/:roomId/account_data/:type', requ
     return Errors.badJson().toResponse();
   }
 
-  // Store account data
-  await db.prepare(`
-    INSERT INTO account_data (user_id, room_id, event_type, content)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
-      content = excluded.content
-  `).bind(targetUserId, roomId, eventType, JSON.stringify(content)).run();
-
-  // Record change for sync
-  await recordAccountDataChange(db, targetUserId, roomId, eventType);
+  await publishAccountData(c.env, targetUserId, roomId, eventType, content);
 
   return c.json({});
 });
@@ -492,11 +448,7 @@ export async function getAllRoomAccountData(
 // ============================================
 
 export async function getAccountDataStreamPosition(db: D1Database): Promise<number> {
-  const result = await db.prepare(`
-    SELECT position FROM stream_positions WHERE stream_name = 'account_data'
-  `).first<{ position: number }>();
-
-  return result?.position || 0;
+  return accountDataPosition(db);
 }
 
 export default app;

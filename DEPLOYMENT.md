@@ -27,7 +27,7 @@ Cloudflare Workers Builds is connected to GitHub with:
 - Root directory: `/`
 - Build command: `npm run check`
 - Deploy command: `npm run deploy`
-- Node version: `22.22.3`
+- Node version: `24` (supported LTS major, latest available patch)
 
 The native GitHub integration triggers Cloudflare builds on pushes to `main`, including documentation changes. Events may take a few minutes to appear after initial setup. Inspect failures under **Workers & Pages → matrix-workers → Builds**. A failed check or database migration prevents deployment. GitHub Actions independently runs checks and CodeQL; Cloudflare runs its own checks before deploying. No deploy hook or Cloudflare secret is needed in GitHub.
 
@@ -41,6 +41,20 @@ npm run smoke -- https://m.sgr.ski
 ```
 
 The deployment runs pending database migrations first. Design future migrations to remain compatible with the currently deployed Worker during rollout. Worker rollbacks do not roll back D1 data.
+
+## Ongoing updates
+
+Dependabot checks npm dependencies and pinned GitHub Actions daily. Compatible minor/patch updates are grouped; major upgrades get separate PRs for review. Enable **Dependabot alerts** and **Dependabot security updates** in the repository's security settings so vulnerability fixes can be proposed between regular scans.
+
+The daily CI schedule also checks the current branch when no new commit arrives. Every PR runs the complete typecheck, regression suite, dependency audit and Worker build on the latest patches of Node 22 and 24, applies all D1 migrations to a fresh local Workers database, and checks that the migration ledger prevents reapplication. CodeQL and dependency review must also pass. Production builds use the supported Node LTS major configured in Cloudflare; keep that major consistent with `.nvmrc`. Floating within the selected major allows security patches without an unreviewed major change. The [official Node schedule](https://github.com/nodejs/Release/blob/main/schedule.json) lists supported release dates.
+
+Protect `main` with strict required checks **`check (22)`**, **`check (24)`**, **`codeql`**, and **`dependency-review`**. Keep force pushes and deletion disabled. Administrator bypass may remain available for a deliberately verified manual release; the update workflow's `GITHUB_TOKEN` cannot bypass protection. Public repositories can use these protections and CodeQL without GitHub Advanced Security purchase. Default Actions permissions remain read-only; automatic PR approvals are unnecessary.
+
+Every 30 minutes, `dependabot-automerge.yml` looks for successfully tested update PRs and evaluates only PR metadata and file contents as data, using trusted code from `main`. It verifies the real Dependabot account, unchanged tested commit, same-repository branch, strict protection, and every required job. npm updates must preserve package scripts and other metadata, use registry sources, and avoid major/prerelease changes, including transitive major changes and potentially breaking 0.x minor updates. Actions updates may only replace official `actions/*` or `github/*` pins with same-major version-tagged SHAs; workflow logic and permissions must remain identical. Unsupported changes stay open for review.
+
+The merge request includes the verified head SHA, preventing a changed branch from merging without another successful validation. It performs a protected squash merge directly after the checks instead of leaving auto-merge armed for a future untested update. No PR code, downloaded artifacts, or PR cache is executed with the write token; no privileged PR-triggered workflow is used. A bot merge made with `GITHUB_TOKEN` [does not start another GitHub push workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow). Cloudflare's independent [Workers & Pages GitHub App builds on repository pushes](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/), so it is expected to perform its own checks and production migrations for these merges. Neither documentation explicitly tests this token/merge combination: verify the first automatic merge against the matching Cloudflare build commit SHA before treating the complete rollout chain as proven. Inspect **Actions → CI / Merge tested dependency updates** and Cloudflare **Builds** for failed or skipped updates. GitHub schedules can be delayed and public-repository schedules are disabled after 60 days without repository activity; restore them in Actions when necessary. Major Node/Workers compatibility changes still require a tested migration; updates cannot promise to eliminate all future defects.
+
+**Actions → Public production health** runs hourly and can also be triggered manually. It checks the public `/health`, Matrix client versions, and federation signing-key endpoint at `m.sgr.ski` using bounded GET requests with 45-second timeouts. It verifies health status, a nonempty versions list, and the expected server/key identity and expiry. It uses no passwords or tokens and creates no accounts, messages or registrations. This workflow is separate from required PR checks so a service or platform outage is reported without blocking unrelated code changes.
 
 ## Create the first administrator
 
@@ -67,13 +81,16 @@ D1 tracks applied filenames in `d1_migrations`. The original `schema.sql` is now
 
 **For an older installation with manually applied SQL:** export/back up the database and reconcile the already-applied filenames before adopting the migration runner. Do not blindly replay the full chain: historical migrations include `ALTER TABLE` and table rebuilds. The installation documented here uses a fresh database and the migration ledger from its first deployment.
 
-Before major database changes:
+Before major database changes, record a [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/) recovery bookmark and confirm the recovery window. A full SQL export of this installation currently fails on FTS5 virtual tables. A filtered data export can additionally preserve the relevant ordinary tables, for example:
 
 ```bash
-npx wrangler d1 export DB --remote --output .local/matrix-backup.sql
+npx wrangler d1 export DB --remote --no-schema \
+  --table=rooms --table=events --table=room_memberships --table=room_state \
+  --table=room_aliases --table=account_data --table=push_rules \
+  --output .local/room-migration-data.sql
 ```
 
-Create `.local` first if needed. Treat exports as private: they include account and message data. Recovery options are described in [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+Create `.local` first if needed. Include other existing tables relevant to the operation, such as its upgrade ledger and historical snapshots. This selected data extract is a supplemental backup; it does not contain the complete database, schema, migration ledger or search indexes. Use Time Travel for full database recovery. Treat exports as private: they include account and message data. Never restore them blindly into a live database.
 
 ## Deploy a separate fork
 

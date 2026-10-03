@@ -1,0 +1,29 @@
+name: Merge tested dependency updates
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: dependency-merge-main
+  cancel-in-progress: false
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      # This privileged workflow reads ONLY trusted main code. No PR checkout,
+      # npm installation, cache restore, or artifacts from PR CI runs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { mergePendingUpdates } = require('./.github/scripts/dependabot-automerge.cjs');
+            await mergePendingUpdates({ github, context, core });

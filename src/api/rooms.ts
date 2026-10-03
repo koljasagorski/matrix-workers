@@ -29,6 +29,8 @@ import { buildLocalRoomEvent, persistLocalRoomEvent, rejectRemoteInvite, sendLoc
 import { resolveRoomAlias, locateRoom, joinRemoteRoom, remoteRoomSummary } from '../services/remote-rooms';
 import { getRemoteHistory, getHistoricalEvent } from '../services/room-history';
 import { requireAliasDeleteAccess, requireLocalRoomAlias } from '../services/room-alias-access';
+import { upgradeRoom } from '../services/room-upgrades';
+import { notifyAccountDataUser, storeAccountData } from '../services/account-data-stream';
 
 const app = new Hono<AppEnv>({ strict: false });
 app.onError((error, c) => {
@@ -260,11 +262,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
 
     // Initialize m.fully_read marker for the room creator
     // This ensures the room doesn't show all messages as unread
-    await c.env.DB.prepare(`
-      INSERT INTO account_data (user_id, room_id, event_type, content)
-      VALUES (?, ?, 'm.fully_read', ?)
-      ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET content = excluded.content
-    `).bind(userId, roomId, JSON.stringify({ event_id: createEventId })).run();
+    await storeAccountData(c.env.DB, userId, roomId, 'm.fully_read', { event_id: createEventId });
     console.log('[createRoom] Initialized m.fully_read marker for creator');
   } catch (err) {
     console.error('[createRoom] Failed to create initial room events:', err);
@@ -275,6 +273,10 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     ]);
     throw err;
   }
+
+  // The room and its read marker are committed. A notification failure must not
+  // delete a room whose signed events may already have reached another server.
+  await notifyAccountDataUser(c.env, userId).catch(error => console.error('[createRoom] Read-marker wake failed:', error));
 
   // Create room alias if provided
   if (room_alias_local_part) {
@@ -594,7 +596,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     }
   } else {
     if (from) {
-      const tokenStr = from.replace(/^s?(-?\d+)(?:_td\d+)?(?:_dk\d+)?(?:_rr\d+)?$/, '$1');
+      const tokenStr = from.replace(/^s?(-?\d+)(?:_td\d+)?(?:_dk\d+)?(?:_rr\d+)?(?:_ad\d+)?$/, '$1');
       if (!/^-?\d+$/.test(tokenStr) || !Number.isSafeInteger(Number(tokenStr))) return Errors.invalidParam('from').toResponse();
       fromToken = Number(tokenStr);
     }
@@ -1242,56 +1244,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   if (!isObject(body)) return Errors.badJson().toResponse();
   if (body.new_version === undefined) return Errors.missingParam('new_version').toResponse();
   if (typeof body.new_version !== 'string' || !FEDERATED_ROOM_VERSIONS.includes(body.new_version)) return Errors.unsupportedRoomVersion().toResponse();
-  const oldRoom = await getRoom(c.env.DB, oldRoomId);
-  if (!oldRoom) return Errors.notFound('Room not found').toResponse();
-  const existing = await getStateEvent(c.env.DB, oldRoomId, 'm.room.tombstone');
-  if (existing && typeof existing.content.replacement_room === 'string') {
-    if ((await getMembership(c.env.DB, oldRoomId, userId))?.membership !== 'join') return Errors.forbidden().toResponse();
-    return c.json({ replacement_room: existing.content.replacement_room });
-  }
-  const currentState = await getRoomState(c.env.DB, oldRoomId);
-  const previous = await c.env.DB.prepare('SELECT event_id FROM events WHERE room_id=? ORDER BY depth DESC LIMIT 1')
-    .bind(oldRoomId).first<{ event_id: string }>();
-  let newRoomId = await generateRoomId(c.env.SERVER_NAME);
-  const created = await buildLocalRoomEvent(c.env, { roomId: newRoomId, sender: userId, type: 'm.room.create', stateKey: '',
-    content: { room_version: body.new_version, ...(body.new_version === '10' ? { creator: userId } : {}),
-      predecessor: { room_id: oldRoomId, event_id: previous?.event_id ?? '' },
-      ...(currentState.find(event => event.type === 'm.room.create')?.content['m.federate'] === false ? { 'm.federate': false } : {}),
-    } }, body.new_version);
-  if (body.new_version === '12') newRoomId = `!${created.event.event_id.slice(1)}`;
-  created.event.room_id = newRoomId;
-  // Check upgrade permission before creating any replacement room.
-  await buildLocalRoomEvent(c.env, { roomId: oldRoomId, sender: userId, type: 'm.room.tombstone', stateKey: '',
-    content: { body: 'This room has been replaced', replacement_room: newRoomId } });
-  await createRoom(c.env.DB, newRoomId, body.new_version, userId, !!oldRoom.is_public);
-  const copyTypes = new Set(['m.room.join_rules', 'm.room.history_visibility', 'm.room.name', 'm.room.topic',
-    'm.room.avatar', 'm.room.encryption', 'm.room.guest_access', 'm.room.server_acl']);
-  await createInitialRoomEvents(c.env, created.event, body.new_version, {
-    initial_state: currentState.filter(event => event.state_key === '' && copyTypes.has(event.type))
-      .map(event => ({ type: event.type, state_key: '', content: event.content })),
-  });
-  const oldPower = currentState.find(event => event.type === 'm.room.power_levels');
-  if (oldPower) {
-    const users: Record<string, unknown> = isObject(oldPower.content.users) ? { ...oldPower.content.users } : {};
-    if (body.new_version === '12') delete users[userId];
-    await sendLocalRoomEvent(c.env, { roomId: newRoomId, sender: userId, type: 'm.room.power_levels', stateKey: '',
-      content: { ...oldPower.content, users } });
-  }
-  await sendLocalRoomEvent(c.env, { roomId: oldRoomId, sender: userId, type: 'm.room.tombstone', stateKey: '',
-    content: { body: 'This room has been replaced', replacement_room: newRoomId } });
-  // Permission to send a tombstone does not imply permission to change all power
-  // levels. Restrict posting only when the ordinary event auth permits it.
-  if (oldPower) {
-    try {
-      await sendLocalRoomEvent(c.env, { roomId: oldRoomId, sender: userId, type: 'm.room.power_levels', stateKey: '',
-        content: { ...oldPower.content, events_default: Math.max(Number(oldPower.content.events_default ?? 0), 100),
-          invite: Math.max(Number(oldPower.content.invite ?? 0), 100) } });
-    } catch (error) {
-      if (!(error instanceof MatrixApiError) || error.status !== 403) throw error;
-    }
-  }
-  await c.env.DB.prepare('UPDATE room_aliases SET room_id=? WHERE room_id=?').bind(newRoomId, oldRoomId).run();
-  return c.json({ replacement_room: newRoomId });
+  const replacement = await upgradeRoom(c.env, { oldRoomId, actorUserId: userId, newVersion: body.new_version,
+    additionalCreators: body.additional_creators });
+  return c.json({ replacement_room: replacement });
 });
 
 export default app;
