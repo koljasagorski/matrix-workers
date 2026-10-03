@@ -115,7 +115,7 @@ async function legacyRoom(remoteMembership?: 'invite' | 'join') {
 }
 async function remotePeer(respond?: (event: WireEvent) => Promise<Response | undefined>) {
   const key = await generateSigningKeyPair();
-  await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
+  await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
   ctx.sqlite.prepare(`INSERT INTO remote_server_keys(server_name,key_id,public_key,valid_from,valid_until,fetched_at,verified)
     VALUES('remote.example',?,?,?,?,?,1)`).run(key.keyId, key.publicKey, Date.now() - 1000, Date.now() + 86400000, Date.now());
   const invites: { event: WireEvent; path: string; state: unknown[] }[] = [];

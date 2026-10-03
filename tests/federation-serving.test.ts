@@ -24,7 +24,7 @@ beforeEach(async () => {
     queued.push(await input.json() as typeof queued[number]); return Response.json({});
   } }) } as unknown as Env['FEDERATION'];
   ctx.env.PUSH_NOTIFICATION_WORKFLOW = { create: async () => ({}) } as unknown as Env['PUSH_NOTIFICATION_WORKFLOW'];
-  await ctx.env.CACHE.put(`discovery:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
+  await ctx.env.CACHE.put(`discovery:v2:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
   const keyResponse = await signJson({ server_name: remote, valid_until_ts: Date.now() + 86400000,
     verify_keys: { [remoteKey.keyId]: { key: remoteKey.publicKey } } }, remote, remoteKey.keyId, remoteKey.privateKeyJwk);
   vi.stubGlobal('fetch', vi.fn(async () => Response.json(keyResponse)));

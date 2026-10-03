@@ -40,7 +40,7 @@ function memoryStorage() {
 async function fixture(...destinations: string[]) {
   const { env, sqlite } = await testEnv();
   for (const destination of destinations.length ? destinations : ['remote.example']) {
-    await env.CACHE.put(`discovery:${destination}`, JSON.stringify({ host: destination, port: 443, tlsHostname: destination }));
+    await env.CACHE.put(`discovery:v2:${destination}`, JSON.stringify({ host: destination, port: 443, tlsHostname: destination }));
   }
   const state = memoryStorage();
   const object = new FederationDurableObject({ storage: state.storage } as any, env);

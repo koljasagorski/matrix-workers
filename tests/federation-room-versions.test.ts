@@ -65,7 +65,7 @@ describe('federated joins with an independently signed invite power level', () =
       auth_events: [...createAuth, powerId, rulesId, inviteId], prev_events: [peerReferenceId(state.at(-1)!, version)] };
     let sendCount = 0;
     let makeCount = 0;
-    await env.CACHE.put(`discovery:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
+    await env.CACHE.put(`discovery:v2:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
       if (url.pathname === '/_matrix/key/v2/server') return Response.json(keyResponse);

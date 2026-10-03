@@ -12,7 +12,7 @@ function multipart(data = binary, headers = 'Content-Type: image/png', chunkSize
     controller.enqueue(bytes.subarray(at,at+chunkSize)); at+=chunkSize;
   }}),{headers:{'Content-Type':'multipart/mixed; boundary="matrix-media"'}});
 }
-beforeEach(async()=>{ctx=await testEnv();await ctx.env.CACHE.put('discovery:remote.example',JSON.stringify({host:'delegated.example',port:443,tlsHostname:'delegated.example'}));});
+beforeEach(async()=>{ctx=await testEnv();await ctx.env.CACHE.put('discovery:v2:remote.example',JSON.stringify({host:'delegated.example',port:443,tlsHostname:'delegated.example'}));});
 afterEach(()=>{ctx.sqlite.close();vi.unstubAllGlobals();});
 it.each([1,7,1024])('streams binary MIME intact across chunks of %i bytes',async size=>{
   const response=await decodeFederationMedia(multipart(binary,undefined,size));

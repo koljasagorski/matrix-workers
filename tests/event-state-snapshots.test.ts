@@ -77,7 +77,7 @@ it('reconstructs legacy linear history and merges only identical parent states',
 it('imports a verified pre-join baseline across a history gap and keeps it after later local changes', async () => {
   const fixture = await roomFixture('11');
   vi.stubGlobal('fetch', vi.fn(async () => Response.json(fixture.keyResponse)));
-  await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: fixture.remote, port: 443, tlsHostname: fixture.remote }));
+  await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({ host: fixture.remote, port: 443, tlsHostname: fixture.remote }));
   const verify = eventVerifier(ctx.env);
   const state = await Promise.all(fixture.events.map(event => verify(event, '11', fixture.roomId)));
   const signed = await signEvent({ ...fixture.template, prev_events: ['$history-not-fetched'] }, '11', ctx.env.SERVER_NAME, ctx.localKey);

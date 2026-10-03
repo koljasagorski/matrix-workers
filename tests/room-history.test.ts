@@ -22,7 +22,7 @@ beforeEach(async () => {
   ctx = await testEnv(); fixture = await roomFixture(); wire = new Map(); snapshots = new Map(); oldMessages = [];
   peerFailure = false; tamper = false;
   base = `/_matrix/client/v3/rooms/${encodeURIComponent(fixture.roomId)}`;
-  await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({host:'remote.example',port:443,tlsHostname:'remote.example'}));
+  await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({host:'remote.example',port:443,tlsHostname:'remote.example'}));
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: RequestInit) => {
     const url = new URL(input);
     if (url.pathname === '/_matrix/key/v2/server') return Response.json(fixture.keyResponse);

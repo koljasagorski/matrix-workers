@@ -15,7 +15,7 @@ let sentJoins: Record<string, any>[];
 
 beforeEach(async () => {
   ctx = await testEnv(); fixture = await roomFixture(); sentJoins = [];
-  await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({host:'delegated.example',port:443,tlsHostname:'delegated.example'}));
+  await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({host:'delegated.example',port:443,tlsHostname:'delegated.example'}));
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
     if (url.pathname === '/_matrix/key/v2/server') {

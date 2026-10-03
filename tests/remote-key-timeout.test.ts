@@ -10,7 +10,7 @@ function hangs(signal: AbortSignal) {
 afterEach(()=>vi.unstubAllGlobals());
 it.each([false,true])('bounds a %s key lookup while retaining successful servers',async claim=>{
   const {env,sqlite}=await testEnv();
-  for (const server of ['slow.example','fast.example']) await env.CACHE.put('discovery:'+server,JSON.stringify({host:server,port:443,tlsHostname:server}));
+  for (const server of ['slow.example','fast.example']) await env.CACHE.put('discovery:v2:'+server,JSON.stringify({host:server,port:443,tlsHostname:server}));
   vi.stubGlobal('fetch',vi.fn(async(input,init)=>String(input).includes('slow.example') ? hangs(init.signal) :
     Response.json({[claim?'one_time_keys':'device_keys']:{'@bob:fast.example':{DEVICE:{key:'public'}}}})));
   try {

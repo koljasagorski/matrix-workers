@@ -29,7 +29,9 @@ interface CloudflareDNSResponse {
 }
 
 // Cache key prefix for server discovery
-const DISCOVERY_CACHE_PREFIX = 'discovery:';
+// Earlier discovery treated well-known redirects as failures. Do not keep using
+// cached default:8448 fallbacks after correcting that behavior.
+const DISCOVERY_CACHE_PREFIX = 'discovery:v2:';
 const DISCOVERY_CACHE_TTL = 3600; // 1 hour
 
 /**
@@ -142,12 +144,30 @@ async function tryWellKnown(serverName: string, signal?: AbortSignal): Promise<S
   }
 
   try {
-    const response = await fetch(wellKnownUrl, {
-      headers: { Accept: 'application/json' },
-      redirect: 'manual',
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
-      cf: { cacheTtl: 3600, cacheEverything: true },
-    });
+    const timeout = AbortSignal.timeout(10000);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    let current = wellKnownUrl;
+    const visited = new Set<string>();
+    let response: Response | undefined;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      const parsed = new URL(current);
+      parsed.hash = '';
+      assertDiscoveryRedirectUrl(parsed);
+      current = parsed.toString();
+      if (visited.has(current)) return null;
+      visited.add(current);
+      response = await fetch(current, {
+        headers: { Accept: 'application/json' }, redirect: 'manual', signal: requestSignal,
+        cf: { cacheTtl: 3600, cacheEverything: true },
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get('Location');
+      await response.body?.cancel();
+      if (!location || redirects === 5) return null;
+      current = new URL(location, current).toString();
+      response = undefined;
+    }
+    if (!response) return null;
 
     if (!response.ok) {
       await response.body?.cancel();
@@ -199,6 +219,20 @@ async function tryWellKnown(serverName: string, signal?: AbortSignal): Promise<S
     // Well-known not available or invalid
     console.debug(`Well-known lookup failed for ${serverName}:`, error);
     return null;
+  }
+}
+
+function assertDiscoveryRedirectUrl(url: URL): void {
+  assertFederationUrl(url.toString());
+  // A trailing DNS dot and URL-canonicalized IPv4-mapped IPv6 forms must not
+  // evade the hostname/IP checks used for every redirect destination.
+  const normalized = new URL(url);
+  normalized.hostname = normalized.hostname.replace(/\.$/, '');
+  assertFederationUrl(normalized.toString());
+  const mapped = normalized.hostname.replace(/^\[|\]$/g, '').match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (mapped) {
+    const first = parseInt(mapped[1], 16), second = parseInt(mapped[2], 16);
+    assertFederationUrl(`https://${first >>> 8}.${first & 255}.${second >>> 8}.${second & 255}/`);
   }
 }
 

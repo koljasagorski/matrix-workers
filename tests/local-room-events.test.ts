@@ -214,7 +214,7 @@ describe('authorized signed local room events', () => {
     const old = await create('10', { name: 'Before upgrade', initial_state: [{ type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } }] });
     await addRemoteResident(old, '10'); queued = [];
     const key = await generateSigningKeyPair();
-    await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
+    await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
     ctx.sqlite.prepare(`INSERT INTO remote_server_keys(server_name,key_id,public_key,valid_from,valid_until,fetched_at,verified)
       VALUES('remote.example',?,?,?,?,?,1)`).run(key.keyId, key.publicKey, Date.now() - 1000, Date.now() + 86400000, Date.now());
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -292,7 +292,7 @@ describe('remote membership handshakes', () => {
     const keys = new Map<string, Awaited<ReturnType<typeof generateSigningKeyPair>>>();
     for (const server of ['remote.example', 'other.example']) {
       const key = await generateSigningKeyPair(); keys.set(server, key);
-      await ctx.env.CACHE.put(`discovery:${server}`, JSON.stringify({ host: server, port: 443, tlsHostname: server }));
+      await ctx.env.CACHE.put(`discovery:v2:${server}`, JSON.stringify({ host: server, port: 443, tlsHostname: server }));
       ctx.sqlite.prepare(`INSERT INTO remote_server_keys(server_name,key_id,public_key,valid_from,valid_until,fetched_at,verified)
         VALUES(?,?,?,?,?,?,1)`).run(server, key.keyId, key.publicKey, Date.now() - 1000, Date.now() + 86400000, Date.now());
     }
@@ -339,7 +339,7 @@ describe('remote membership handshakes', () => {
     const remote = 'remote.example'; const key = await generateSigningKeyPair();
     const keyResponse = await signJson({ server_name: remote, valid_until_ts: Date.now() + 86400000,
       verify_keys: { [key.keyId]: { key: key.publicKey } } }, remote, key.keyId, key.privateKeyJwk);
-    await ctx.env.CACHE.put(`discovery:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
+    await ctx.env.CACHE.put(`discovery:v2:${remote}`, JSON.stringify({ host: remote, port: 443, tlsHostname: remote }));
     let inviteCount = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
@@ -364,7 +364,7 @@ describe('remote membership handshakes', () => {
 
   it('does not persist an invitation which the destination server refuses', async () => {
     const roomId = await create();
-    await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
+    await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ errcode: 'M_FORBIDDEN', error: 'No invitation permitted' }, { status: 403 })));
     const response = await request(roomPath(roomId, 'invite'), 'POST', { user_id: '@guest:remote.example' });
     expect(response.status).toBe(403);
@@ -376,7 +376,7 @@ describe('remote membership handshakes', () => {
     const invite = await signEvent({ ...fixture.template, sender: '@creator:remote.example', state_key: alice,
       content: { membership: 'invite' } }, '12', fixture.remote, fixture.key);
     const inviteId = await eventReferenceId(invite, '12');
-    await ctx.env.CACHE.put('discovery:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
+    await ctx.env.CACHE.put('discovery:v2:remote.example', JSON.stringify({ host: 'remote.example', port: 443, tlsHostname: 'remote.example' }));
     let leave: WireEvent | undefined;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
