@@ -92,6 +92,31 @@ class PositionTests(unittest.TestCase):
         self.assertNotIn("since", json.loads(body)["extensions"]["to_device"])
         self.assertEqual(json.loads(body)["conn_id"], "phone")
 
+    def test_native_sliding_device_cursor_is_independent_of_room_position(self):
+        native = "5/s247_0_0_0_0_0_0_0_0_0_0"
+        for path in (NATIVE_SLIDING_PATH, "/_matrix/client/v4/sync",
+                     "/_matrix/client/unstable/org.matrix.msc3575/sync",
+                     "/_matrix/client/unstable/org.matrix.msc4186/sync"):
+            for position_location in ("query", "body", "initial"):
+                for since in ("0", "247", "1000"):
+                    with self.subTest(path=path, position=position_location, since=since):
+                        payload = {"conn_id": "phone", "extensions": {
+                            "to_device": {"enabled": True, "since": since, "limit": 1},
+                            "e2ee": {"enabled": True}, "account_data": {"enabled": True},
+                        }}
+                        query = [("timeout", "1")]
+                        if position_location == "query":
+                            query.append(("pos", native))
+                        elif position_location == "body":
+                            payload["pos"] = native
+                        normalized_path, normalized_query, body, legacy = normalize_request(path, query, json.dumps(payload).encode())
+                        expected = dict(payload)
+                        expected.pop("pos", None)
+                        self.assertFalse(legacy)
+                        self.assertEqual(normalized_path, NATIVE_SLIDING_PATH)
+                        self.assertEqual(json.loads(body), expected)
+                        self.assertEqual(normalized_query, [("timeout", "1")] + ([] if position_location == "initial" else [("pos", native)]))
+
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -114,6 +139,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.raw_calls = []
         self.signed_validator = None
         self.health_available = True
+        self.sliding_messages = None
 
         async def upstream(request):
             body = await request.read()
@@ -137,6 +163,15 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 self.valid_tokens.remove(token)
             if request.path.endswith("/whoami"):
                 return web.json_response({"user_id": "@alice:example.org", "device_id": "KEPT_DEVICE"})
+            if request.path == NATIVE_SLIDING_PATH and self.sliding_messages is not None:
+                extension = json.loads(body)["extensions"]["to_device"]
+                since = int(extension.get("since", "0"))
+                self.sliding_messages = [row for row in self.sliding_messages if row[0] > since]
+                batch = self.sliding_messages[:extension.get("limit", 100)]
+                return web.json_response({"pos": "5/s247_0_0_0_0_0_0_0_0_0_0", "extensions": {"to_device": {
+                    "next_batch": str(batch[-1][0] if batch else since),
+                    "events": [row[1] for row in batch],
+                }}})
             return web.json_response({"next_batch": "s7_0_0_0_0_0_0_0_0_0", "device_id": "KEPT_DEVICE", "keys": {"ciphertext": "unchanged"}})
 
         self.upstream = TestServer(web.Application())
@@ -169,6 +204,23 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[-1][1], [("since", native)])
         self.assertEqual((await self.client.get("/_matrix/client/v3/sync", headers={"Authorization": "Bearer new-native-access"})).status, 200)
         self.assertEqual(self.calls[-1][2], "Bearer new-native-access")
+
+    async def test_sliding_device_acknowledgements_advance_and_drain_bounded_batches(self):
+        for path in (NATIVE_SLIDING_PATH, "/_matrix/client/v4/sync"):
+            with self.subTest(path=path):
+                self.sliding_messages = [(i, {"type": "m.test", "content": {"number": i}}) for i in range(1, 4)]
+                extension = {"enabled": True, "limit": 1}
+                query = []
+                for expected in (1, 2, 3, None):
+                    response = await self.client.post(path, params=query, json={"extensions": {"to_device": dict(extension)}}, headers={"Authorization": "Bearer new-native-access"})
+                    self.assertEqual(response.status, 200)
+                    result = await response.json()
+                    device = result["extensions"]["to_device"]
+                    self.assertEqual(device["events"], [] if expected is None else [{"type": "m.test", "content": {"number": expected}}])
+                    self.assertEqual(json.loads(self.calls[-1][3])["extensions"]["to_device"], extension)
+                    extension["since"] = device["next_batch"]
+                    query = [("pos", result["pos"])]
+                self.assertEqual(self.sliding_messages, [])
 
     async def test_refresh_returns_native_tokens(self):
         response = await self.client.post("/_matrix/client/v3/refresh", json={"refresh_token": "old-refresh"})

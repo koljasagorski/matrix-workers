@@ -83,12 +83,14 @@ def normalize_request(path, query, body):
                 legacy = True
             elif not any(key == "pos" for key, _ in query):
                 query.append(("pos", position))
-        # Old extensions have independent custom positions as well.
+        # Synapse's native to-device cursor is also a decimal string. Only
+        # reset that independent cursor when the room position proves this is
+        # an old sync request; otherwise acknowledgements must pass through.
         extensions = parsed.get("extensions", {})
         if not isinstance(extensions, dict):
             raise ValueError("Extensions must be an object")
         to_device = extensions.get("to_device", {})
-        if isinstance(to_device, dict) and isinstance(to_device.get("since"), str) and LEGACY_POSITION.fullmatch(to_device["since"]):
+        if legacy and isinstance(to_device, dict) and isinstance(to_device.get("since"), str) and LEGACY_POSITION.fullmatch(to_device["since"]):
             to_device.pop("since")
         body = json.dumps(parsed, separators=(",", ":")).encode()
         path = NATIVE_SLIDING_PATH

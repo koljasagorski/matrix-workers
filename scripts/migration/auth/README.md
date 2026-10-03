@@ -99,7 +99,11 @@ It applies only to health, so clients cannot bypass maintenance for Matrix APIs.
 
 The gateway recognizes only the exact old numeric/`_td`/`_dk`/`_rr`/`_ad` sync
 position grammar. Such positions become an initial sync; opaque native positions
-are preserved. No device state or crypto data is reset. Existing nonnumeric saved
+are preserved. Sliding-sync to-device acknowledgements use native decimal
+cursors and pass through, including when there is no overall sync position.
+The bridge resets an old extension cursor only when the overall position
+identifies a legacy request. A decimal extension cursor alone cannot identify
+the old server. No device state or crypto data is reset. Existing nonnumeric saved
 filter IDs are looked up for the authenticated owner and forwarded as inline
 filters. The old sliding-sync paths are mapped to Synapse's built-in simplified
 sliding-sync endpoint. An optional archive module receives the normalized query,
