@@ -254,7 +254,7 @@ function getDefaultRulesForUser(userId: string): {
   };
 }
 
-async function getUserPushRules(db: D1Database, userId: string): Promise<{
+export async function getUserPushRules(db: D1Database, userId: string): Promise<{
   global: {
     override: PushRule[];
     content: PushRule[];
@@ -285,13 +285,15 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
     let actions: any[];
 
     try {
-      conditions = row.conditions ? JSON.parse(row.conditions) : undefined;
+      const parsed = row.conditions ? JSON.parse(row.conditions) : undefined;
+      conditions = Array.isArray(parsed) ? parsed : undefined;
     } catch {
       conditions = undefined;
     }
 
     try {
-      actions = JSON.parse(row.actions);
+      const parsed = JSON.parse(row.actions);
+      actions = Array.isArray(parsed) ? parsed : [];
     } catch {
       actions = [];
     }
@@ -303,6 +305,13 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
       actions,
       conditions,
     };
+    if (row.kind === 'content') {
+      const storedPattern = conditions?.find(condition => condition.kind === 'event_match' && condition.key === 'content.body')?.pattern;
+      ruleData.conditions = undefined;
+      ruleData.pattern = storedPattern;
+      // Older writes discarded the pattern. Such a row cannot safely match every message.
+      if (typeof storedPattern !== 'string' || !storedPattern) ruleData.enabled = false;
+    }
 
     const kindRules = rules[row.kind as keyof typeof rules];
     if (kindRules) {
@@ -514,6 +523,9 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
       error: 'Only global scope is supported',
     }, 400);
   }
+  if (!['override', 'content', 'room', 'sender', 'underride'].includes(kind)) {
+    return Errors.invalidParam('kind').toResponse();
+  }
 
   // Can't modify default rules (they start with .)
   if (ruleId.startsWith('.m.rule.')) {
@@ -530,14 +542,24 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
     return Errors.badJson().toResponse();
   }
 
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return Errors.badJson().toResponse();
+
   const { actions, conditions, pattern } = body;
 
   if (!actions) {
     return Errors.missingParam('actions').toResponse();
   }
+  if (!Array.isArray(actions) || actions.some(action => typeof action !== 'string' &&
+      (!action || typeof action !== 'object' || typeof action.set_tweak !== 'string'))) {
+    return Errors.invalidParam('actions').toResponse();
+  }
+  if (conditions !== undefined && (!Array.isArray(conditions) || conditions.some(condition =>
+      !condition || typeof condition !== 'object' || typeof condition.kind !== 'string'))) {
+    return Errors.invalidParam('conditions').toResponse();
+  }
 
   // Content rules require pattern
-  if (kind === 'content' && !pattern) {
+  if (kind === 'content' && (typeof pattern !== 'string' || !pattern)) {
     return Errors.missingParam('pattern').toResponse();
   }
 
@@ -566,6 +588,10 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
     priority = Date.now();
   }
 
+  const storedConditions = kind === 'content'
+    ? [{ kind: 'event_match', key: 'content.body', pattern }]
+    : conditions;
+
   await db.prepare(`
     INSERT INTO push_rules (user_id, kind, rule_id, conditions, actions, enabled, priority)
     VALUES (?, ?, ?, ?, ?, 1, ?)
@@ -577,7 +603,7 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
     userId,
     kind,
     ruleId,
-    conditions ? JSON.stringify(conditions) : null,
+    storedConditions ? JSON.stringify(storedConditions) : null,
     JSON.stringify(actions),
     priority
   ).run();
@@ -878,16 +904,17 @@ export async function evaluatePushRules(
     state_key?: string;
   },
   roomMemberCount: number,
-  displayName?: string
+  displayName?: string,
+  preparedRules?: Awaited<ReturnType<typeof getUserPushRules>>,
 ): Promise<{ notify: boolean; actions: any[]; highlight: boolean }> {
-  const rules = await getUserPushRules(db, userId);
+  const rules = preparedRules ?? await getUserPushRules(db, userId);
 
   // Combine all rules in priority order
   const allRules = [
     ...rules.global.override,
     ...rules.global.content,
-    ...rules.global.room,
-    ...rules.global.sender,
+    ...rules.global.room.filter(rule => rule.rule_id === event.room_id),
+    ...rules.global.sender.filter(rule => rule.rule_id === event.sender),
     ...rules.global.underride,
   ].filter(r => r.enabled);
 

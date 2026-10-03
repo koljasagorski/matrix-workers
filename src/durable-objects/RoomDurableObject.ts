@@ -2,13 +2,14 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
-import { advanceReceiptPosition, notifyReceiptUsers, parseFederatedReceipts, queueReadReceipt } from '../services/read-receipts';
+import { notifyReceiptUsers, parseFederatedReceipts, queueReadReceipt, receiptAdvances, receiptEventDepths, recordReadReceipts, type ReadReceipt } from '../services/read-receipts';
 import { isServerAllowedInRoom } from '../services/server-acl';
 
 interface RoomSession {
   id: string;
   userId: string;
   deviceId: string | null;
+  roomId?: string;
 }
 
 interface TypingState {
@@ -26,6 +27,7 @@ interface ReceiptData {
 export class RoomDurableObject extends DurableObject<Env> {
   private sessions: Map<WebSocket, RoomSession> = new Map();
   private roomId: string = '';
+  private roomIdStored: boolean = false;
 
   // In-memory typing state - Map of userId -> expiration timestamp
   private typingUsers: Map<string, TypingState> = new Map();
@@ -35,51 +37,64 @@ export class RoomDurableObject extends DurableObject<Env> {
   // threadContext is thread_id ?? 'unthreaded'
   private receiptsCache: Map<string, ReceiptData> = new Map();
   private receiptsCacheLoaded: boolean = false;
+  private receiptsCacheMirrored: boolean = false;
   private receiptImportPromise?: Promise<void>;
+  private receiptWork: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    for (const ws of ctx.getWebSockets()) {
+      const session = ws.deserializeAttachment() as RoomSession | null;
+      if (session?.roomId) { this.roomId = session.roomId; break; }
+    }
   }
 
   // Load receipts from durable storage into cache
   private async loadReceiptsCache(): Promise<void> {
-    if (this.receiptsCacheLoaded) return;
-
-    const stored = await this.ctx.storage.list<ReceiptData>({ prefix: 'receipt:' });
-    for (const [key, value] of stored) {
-      // Handle both old and new key formats for backwards compatibility
-      // Old format: receipt:{userId}:{receiptType}
-      // New format: receipt:{userId}:{receiptType}:{threadContext}
-      const keyWithoutPrefix = key.replace('receipt:', '');
-
-      // Check if this is new format (has user_id in data)
-      if (value.user_id) {
-        const key = `${value.user_id}:${value.receipt_type}:${value.thread_id ?? 'unthreaded'}`;
-        const previous = this.receiptsCache.get(key);
-        if (!previous || previous.ts < value.ts) this.receiptsCache.set(key, value);
-      } else {
-        // Old format - need to add user_id and thread context
-        // Old key: {userId}:{receiptType} where userId is @localpart:server
-        // We need to extract userId - find the receipt_type in the key
-        const receiptType = value.receipt_type;
-        const receiptTypeIndex = keyWithoutPrefix.lastIndexOf(`:${receiptType}`);
-
-        if (receiptTypeIndex > 0) {
-          const userId = keyWithoutPrefix.substring(0, receiptTypeIndex);
-          const threadContext = value.thread_id ?? 'unthreaded';
-          const newCacheKey = `${userId}:${receiptType}:${threadContext}`;
-
-          // Backfill user_id into value
-          value.user_id = userId;
-          this.receiptsCache.set(newCacheKey, value);
-        } else {
-          // Fallback: just use the key with unthreaded suffix
-          const threadContext = value.thread_id ?? 'unthreaded';
-          this.receiptsCache.set(`${keyWithoutPrefix}:${threadContext}`, value);
-        }
-      }
+    if (!this.roomId) this.roomId = await this.ctx.storage.get<string>('room-id') ?? '';
+    if (this.roomId && !this.roomIdStored) {
+      await this.ctx.storage.put('room-id', this.roomId);
+      this.roomIdStored = true;
     }
-    this.receiptsCacheLoaded = true;
+    if (!this.receiptsCacheLoaded) {
+      const stored = await this.ctx.storage.list<ReceiptData>({ prefix: 'receipt:' });
+      const normalized: ReceiptData[] = [];
+      for (const [key, value] of stored) {
+        let userId = value.user_id;
+        if (!userId) {
+          // Legacy keys did not include user_id in the stored value.
+          const keyWithoutPrefix = key.slice('receipt:'.length);
+          const typeIndex = keyWithoutPrefix.lastIndexOf(`:${value.receipt_type}`);
+          if (typeIndex <= 0) continue;
+          userId = keyWithoutPrefix.slice(0, typeIndex);
+        }
+        normalized.push({ ...value, user_id: userId });
+      }
+      const depths = this.roomId
+        ? await receiptEventDepths(this.env.DB, this.roomId, normalized.map(receipt => receipt.event_id)) : new Map<string, number>();
+      for (const receipt of normalized) {
+        const key = `${receipt.user_id}:${receipt.receipt_type}:${receipt.thread_id ?? 'unthreaded'}`;
+        if (receiptAdvances(receipt, this.receiptsCache.get(key), depths)) this.receiptsCache.set(key, receipt);
+      }
+      this.receiptsCacheLoaded = true;
+    }
+    // Previous releases already set receipt-import:v1 but only had a DO copy.
+    // Keep this migration independent of archived EDU recovery and retry failures.
+    if (this.roomId && !this.receiptsCacheMirrored) {
+      if (!await this.ctx.storage.get('receipt-mirror:v1')) {
+        await recordReadReceipts(this.env.DB, this.roomId, [...this.receiptsCache.values()] as ReadReceipt[]);
+        await this.ctx.storage.put('receipt-mirror:v1', true);
+      }
+      this.receiptsCacheMirrored = true;
+    }
+  }
+
+  // D1 reads yield to other requests. Serialize receipt work so progress checked
+  // before a write remains current when durable storage and the cache are updated.
+  private serializeReceiptWork<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.receiptWork.then(work);
+    this.receiptWork = result.then(() => {}, () => {});
+    return result;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -134,54 +149,59 @@ export class RoomDurableObject extends DurableObject<Env> {
       room_id?: string;
     };
 
-    const { user_id, event_id, receipt_type, thread_id } = body;
-    const ts = body.ts ?? Date.now();
-    if (body.room_id) this.roomId = body.room_id;
-    await this.loadReceiptsCache();
+    return this.serializeReceiptWork(async () => {
+      const { user_id, event_id, receipt_type, thread_id } = body;
+      const ts = body.ts ?? Date.now();
+      if (body.room_id) this.roomId = body.room_id;
+      await this.loadReceiptsCache();
 
-    // Determine thread context for storage key
-    // - undefined/absent = "unthreaded" (room-level receipt)
-    // - "main" = main timeline only
-    // - event_id = specific thread
-    const threadContext = thread_id ?? 'unthreaded';
+      // Determine thread context for storage key
+      // - undefined/absent = "unthreaded" (room-level receipt)
+      // - "main" = main timeline only
+      // - event_id = specific thread
+      const threadContext = thread_id ?? 'unthreaded';
 
-    // Store in durable storage with thread-aware key
-    const storageKey = `receipt:${user_id}:${receipt_type}:${threadContext}`;
-    const previous = this.receiptsCache.get(`${user_id}:${receipt_type}:${threadContext}`);
-    if (previous && (previous.ts > ts || (previous.ts === ts && previous.event_id === event_id))) {
-      return Response.json({ updated: false });
-    }
-    const receiptData: ReceiptData = { user_id, event_id, receipt_type, ts, thread_id };
-    await this.ctx.storage.put(storageKey, receiptData);
+      // Store in durable storage with thread-aware key
+      const storageKey = `receipt:${user_id}:${receipt_type}:${threadContext}`;
+      const previous = this.receiptsCache.get(`${user_id}:${receipt_type}:${threadContext}`);
+      const receiptData: ReceiptData = { user_id, event_id, receipt_type, ts, thread_id };
+      const depths = previous && this.roomId
+        ? await receiptEventDepths(this.env.DB, this.roomId, [event_id, previous.event_id]) : new Map<string, number>();
+      if (!receiptAdvances(receiptData, previous, depths)) {
+        if (this.roomId) await recordReadReceipts(this.env.DB, this.roomId, [previous as ReadReceipt]);
+        return Response.json({ updated: false, receipt: previous });
+      }
+      await this.ctx.storage.put(storageKey, receiptData);
 
-    // Update cache
-    this.receiptsCache.set(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
-    await advanceReceiptPosition(this.env.DB);
+      // Update cache
+      this.receiptsCache.set(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
+      if (this.roomId) await recordReadReceipts(this.env.DB, this.roomId, [receiptData as ReadReceipt]);
 
-    // Broadcast to WebSocket clients
-    const message = JSON.stringify({
-      type: 'receipt',
-      user_id,
-      event_id,
-      receipt_type,
-      ts,
-      room_id: this.roomId,
-      thread_id,
-    });
+      // Broadcast to WebSocket clients
+      const message = JSON.stringify({
+        type: 'receipt',
+        user_id,
+        event_id,
+        receipt_type,
+        ts,
+        room_id: this.roomId,
+        thread_id,
+      });
 
-    const webSockets = this.ctx.getWebSockets();
-    for (const ws of webSockets) {
-      const session = ws.deserializeAttachment() as RoomSession | null;
-      if (session && (receipt_type !== 'm.read.private' || session.userId === user_id)) {
-        try {
-          ws.send(message);
-        } catch {
-          // WebSocket may be closed
+      const webSockets = this.ctx.getWebSockets();
+      for (const ws of webSockets) {
+        const session = ws.deserializeAttachment() as RoomSession | null;
+        if (session && (receipt_type !== 'm.read.private' || session.userId === user_id)) {
+          try {
+            ws.send(message);
+          } catch {
+            // WebSocket may be closed
+          }
         }
       }
-    }
 
-    return Response.json({ updated: true });
+      return Response.json({ updated: true, receipt: receiptData });
+    });
   }
 
   // Earlier releases acknowledged receipt EDUs but only archived them. Recover
@@ -194,7 +214,7 @@ export class RoomDurableObject extends DurableObject<Env> {
     const rows = await this.env.DB.prepare(`SELECT origin,content FROM processed_edus
       WHERE edu_type='m.receipt' AND EXISTS (SELECT 1 FROM json_each(processed_edus.content) room WHERE room.key=?)
       ORDER BY processed_at DESC LIMIT 1000`).bind(roomId).all<{ origin: string; content: string }>();
-    const imported = new Map<string, ReceiptData>();
+    const candidates: ReadReceipt[] = [];
     const origins = new Map<string, boolean>();
     for (const row of rows.results) {
       if (!origins.has(row.origin)) origins.set(row.origin, await isServerAllowedInRoom(this.env.DB, roomId, row.origin));
@@ -202,59 +222,62 @@ export class RoomDurableObject extends DurableObject<Env> {
       for (const update of parseFederatedReceipts(JSON.parse(row.content), row.origin)) {
         const receipt = update.receipt;
         if (update.roomId !== roomId || !joined.has(receipt.user_id)) continue;
-        const key = `${receipt.user_id}:${receipt.receipt_type}:${receipt.thread_id ?? 'unthreaded'}`;
-        const previous = imported.get(key) ?? this.receiptsCache.get(key);
-        if (!previous || previous.ts < receipt.ts) imported.set(key, receipt);
+        candidates.push(receipt);
       }
     }
-    // ACL/database reads above can interleave with a newer live update.
-    for (const [key, receipt] of imported) {
-      if ((this.receiptsCache.get(key)?.ts ?? -1) >= receipt.ts) imported.delete(key);
+    const depths = await receiptEventDepths(this.env.DB, roomId,
+      [...candidates, ...this.receiptsCache.values()].map(receipt => receipt.event_id));
+    const imported = new Map<string, ReceiptData>();
+    for (const receipt of candidates) {
+      const key = `${receipt.user_id}:${receipt.receipt_type}:${receipt.thread_id ?? 'unthreaded'}`;
+      if (receiptAdvances(receipt, imported.get(key) ?? this.receiptsCache.get(key), depths)) imported.set(key, receipt);
     }
     if (imported.size) {
+      await recordReadReceipts(this.env.DB, roomId, [...imported.values()] as ReadReceipt[]);
       await this.ctx.storage.put(Object.fromEntries([...imported].map(([key, receipt]) => [`receipt:${key}`, receipt])));
       for (const [key, receipt] of imported) this.receiptsCache.set(key, receipt);
-      await advanceReceiptPosition(this.env.DB);
     }
     await this.ctx.storage.put('receipt-import:v1', true);
   }
 
   // Get all receipts for this room
   private async handleGetReceipts(request: Request): Promise<Response> {
-    await this.loadReceiptsCache();
-    const roomId = new URL(request.url).searchParams.get('room_id');
-    if (roomId) {
-      this.roomId = roomId;
-      this.receiptImportPromise ??= this.importRecordedReceipts(roomId).catch(error => {
-        this.receiptImportPromise = undefined;
-        throw error;
+    return this.serializeReceiptWork(async () => {
+      const roomId = new URL(request.url).searchParams.get('room_id');
+      if (roomId) this.roomId = roomId;
+      await this.loadReceiptsCache();
+      if (roomId) {
+        this.receiptImportPromise ??= this.importRecordedReceipts(roomId).catch(error => {
+          this.receiptImportPromise = undefined;
+          throw error;
+        });
+        await this.receiptImportPromise;
+      }
+
+      // Build Matrix receipt format: { eventId: { receiptType: { userId: { ts, thread_id? } } } }
+      const receipts: Record<string, Record<string, Record<string, { ts: number; thread_id?: string }>>> = {};
+
+      for (const [_key, data] of this.receiptsCache.entries()) {
+        const { user_id, event_id, receipt_type, ts, thread_id } = data;
+
+        if (!receipts[event_id]) {
+          receipts[event_id] = {};
+        }
+        if (!receipts[event_id][receipt_type]) {
+          receipts[event_id][receipt_type] = {};
+        }
+
+        // Include thread_id in response if present and not 'unthreaded'
+        const userData: { ts: number; thread_id?: string } = { ts };
+        if (thread_id && thread_id !== 'unthreaded') {
+          userData.thread_id = thread_id;
+        }
+        receipts[event_id][receipt_type][user_id] = userData;
+      }
+
+      return new Response(JSON.stringify({ receipts }), {
+        headers: { 'Content-Type': 'application/json' },
       });
-      await this.receiptImportPromise;
-    }
-
-    // Build Matrix receipt format: { eventId: { receiptType: { userId: { ts, thread_id? } } } }
-    const receipts: Record<string, Record<string, Record<string, { ts: number; thread_id?: string }>>> = {};
-
-    for (const [_key, data] of this.receiptsCache.entries()) {
-      const { user_id, event_id, receipt_type, ts, thread_id } = data;
-
-      if (!receipts[event_id]) {
-        receipts[event_id] = {};
-      }
-      if (!receipts[event_id][receipt_type]) {
-        receipts[event_id][receipt_type] = {};
-      }
-
-      // Include thread_id in response if present and not 'unthreaded'
-      const userData: { ts: number; thread_id?: string } = { ts };
-      if (thread_id && thread_id !== 'unthreaded') {
-        userData.thread_id = thread_id;
-      }
-      receipts[event_id][receipt_type][user_id] = userData;
-    }
-
-    return new Response(JSON.stringify({ receipts }), {
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 
@@ -325,6 +348,8 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
 
     this.roomId = roomId;
+    await this.ctx.storage.put('room-id', roomId);
+    this.roomIdStored = true;
 
     // Create WebSocket pair
     const webSocketPair = new WebSocketPair();
@@ -338,6 +363,7 @@ export class RoomDurableObject extends DurableObject<Env> {
       id: crypto.randomUUID(),
       userId,
       deviceId,
+      roomId,
     };
 
     // Serialize session for hibernation
@@ -394,6 +420,7 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (!session) return;
 
     try {
+      if (!this.roomId) this.roomId = session.roomId ?? await this.ctx.storage.get<string>('room-id') ?? '';
       const data = typeof message === 'string' ? JSON.parse(message) : null;
       if (!data) return;
 
@@ -477,9 +504,10 @@ export class RoomDurableObject extends DurableObject<Env> {
 
   private async handleReadReceipt(userId: string, eventId: string, threadId?: string): Promise<void> {
     const receipt = { user_id: userId, event_id: eventId, receipt_type: 'm.read' as const, ts: Date.now(), thread_id: threadId };
-    await this.handleSetReceipt(new Request('https://room/receipt', { method: 'PUT', body: JSON.stringify(receipt) }));
+    const response = await this.handleSetReceipt(new Request('https://room/receipt', { method: 'PUT', body: JSON.stringify(receipt) }));
+    const effective = (await response.json() as { receipt: ReadReceipt }).receipt;
     if (this.roomId) {
-      await queueReadReceipt(this.env, this.roomId, receipt);
+      await queueReadReceipt(this.env, this.roomId, effective);
       await notifyReceiptUsers(this.env, this.roomId);
     }
   }

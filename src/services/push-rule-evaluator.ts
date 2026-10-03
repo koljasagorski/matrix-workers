@@ -2,7 +2,7 @@
 // Provides notification and highlight counting using push rule evaluation
 // Extracted for use by sync and sliding-sync endpoints
 
-import { evaluatePushRules } from '../api/push';
+import { evaluatePushRules, getUserPushRules } from '../api/push';
 
 export { evaluatePushRules };
 
@@ -25,7 +25,8 @@ export async function countNotificationsWithRules(
   roomId: string,
   sinceStreamOrdering?: number,
 ): Promise<{ notification_count: number; highlight_count: number }> {
-  // Get the user's read marker
+  // The fully-read marker is a user-controlled anchor. Notification counts also
+  // respect read receipts, including private ones, without moving that anchor.
   let readStreamOrdering = sinceStreamOrdering;
 
   if (readStreamOrdering === undefined) {
@@ -38,36 +39,41 @@ export async function countNotificationsWithRules(
       try {
         const markerContent = JSON.parse(fullyReadMarker.content);
         const readEvent = await db.prepare(`
-          SELECT stream_ordering FROM events WHERE event_id = ?
-        `).bind(markerContent.event_id).first<{ stream_ordering: number }>();
-        readStreamOrdering = readEvent?.stream_ordering;
+          SELECT stream_ordering FROM events WHERE event_id = ? AND room_id = ?
+        `).bind(markerContent.event_id, roomId).first<{ stream_ordering: number | null }>();
+        readStreamOrdering = readEvent?.stream_ordering ?? undefined;
       } catch { /* ignore */ }
     }
   }
 
-  // Get unread events (messages and encrypted events from others)
-  let unreadEvents: UnreadEvent[];
-  if (readStreamOrdering) {
-    const results = await db.prepare(`
-      SELECT event_id, event_type as type, content, sender, room_id, state_key
-      FROM events
-      WHERE room_id = ? AND stream_ordering > ? AND sender != ?
-        AND event_type IN ('m.room.message', 'm.room.encrypted')
-      ORDER BY stream_ordering ASC
-      LIMIT 500
-    `).bind(roomId, readStreamOrdering, userId).all<UnreadEvent>();
-    unreadEvents = results.results;
-  } else {
-    const results = await db.prepare(`
-      SELECT event_id, event_type as type, content, sender, room_id, state_key
-      FROM events
-      WHERE room_id = ? AND sender != ?
-        AND event_type IN ('m.room.message', 'm.room.encrypted')
-      ORDER BY stream_ordering DESC
-      LIMIT 500
-    `).bind(roomId, userId).all<UnreadEvent>();
-    unreadEvents = results.results;
-  }
+  const unthreaded = await db.prepare(`SELECT MAX(e.stream_ordering) AS position
+    FROM receipts r JOIN events e ON e.event_id=r.event_id AND e.room_id=r.room_id
+    WHERE r.room_id=? AND r.user_id=? AND r.receipt_type IN ('m.read','m.read.private') AND r.thread_id=''`)
+    .bind(roomId, userId).first<{ position: number | null }>();
+  const readFloor = Math.max(readStreamOrdering ?? 0, unthreaded?.position ?? 0);
+
+  // Apply the main/thread receipt boundary before LIMIT, otherwise 500 already
+  // read main-timeline events can hide unread thread messages later in the room.
+  // NULL stream positions are historical imports, rather than new notifications.
+  const results = await db.prepare(`
+    SELECT e.event_id, e.event_type, e.content, e.sender, e.room_id, e.state_key
+    FROM events e
+    WHERE e.room_id = ? AND e.sender != ? AND e.stream_ordering > ?
+      AND e.event_type IN ('m.room.message', 'm.room.encrypted')
+      AND e.stream_ordering > COALESCE((
+        SELECT MAX(read_event.stream_ordering) FROM receipts r
+        JOIN events read_event ON read_event.event_id=r.event_id AND read_event.room_id=r.room_id
+        WHERE r.room_id=e.room_id AND r.user_id=? AND r.receipt_type IN ('m.read','m.read.private')
+          AND r.thread_id=CASE WHEN json_valid(e.content) THEN
+            CASE WHEN json_extract(e.content, '$."m.relates_to".rel_type')='m.thread'
+              AND json_type(e.content, '$."m.relates_to".event_id')='text'
+              THEN json_extract(e.content, '$."m.relates_to".event_id') ELSE 'main' END
+            ELSE 'main' END
+      ), 0)
+    ORDER BY e.stream_ordering ASC
+    LIMIT 500
+  `).bind(roomId, userId, readFloor, userId).all<UnreadEvent>();
+  const unreadEvents = results.results;
 
   if (unreadEvents.length === 0) {
     return { notification_count: 0, highlight_count: 0 };
@@ -86,6 +92,8 @@ export async function countNotificationsWithRules(
 
   let notificationCount = 0;
   let highlightCount = 0;
+  // One rule snapshot per count avoids a database query for every unread message.
+  const rules = await getUserPushRules(db, userId);
 
   for (const event of unreadEvents) {
     let parsedContent: Record<string, unknown>;
@@ -107,6 +115,7 @@ export async function countNotificationsWithRules(
       },
       memberCount?.count || 1,
       user?.display_name || undefined,
+      rules,
     );
 
     if (result.notify) {

@@ -17,9 +17,49 @@ export async function receiptPosition(db: D1Database): Promise<number> {
   return row?.position ?? 0;
 }
 
-export async function advanceReceiptPosition(db: D1Database): Promise<void> {
-  await db.prepare(`INSERT INTO stream_positions(stream_name,position) VALUES ('receipts',1)
-    ON CONFLICT(stream_name) DO UPDATE SET position=position+1`).run();
+export async function receiptEventDepths(db: D1Database, roomId: string, eventIds: string[]): Promise<Map<string, number>> {
+  const ids = [...new Set(eventIds)];
+  const depths = new Map<string, number>();
+  for (let i = 0; i < ids.length; i += 90) {
+    const batch = ids.slice(i, i + 90);
+    const rows = await db.prepare(`SELECT event_id,depth FROM events WHERE room_id=? AND event_id IN (${batch.map(() => '?').join(',')})`)
+      .bind(roomId, ...batch).all<{ event_id: string; depth: number }>();
+    for (const row of rows.results) depths.set(row.event_id, row.depth);
+  }
+  return depths;
+}
+
+// Event progress takes precedence over clocks supplied by clients and remote
+// servers. Unknown events and branches at the same depth retain timestamp order.
+export function receiptAdvances(next: Pick<ReadReceipt, 'event_id' | 'ts'>,
+  previous: Pick<ReadReceipt, 'event_id' | 'ts'> | undefined, depths: ReadonlyMap<string, number>): boolean {
+  if (!previous) return true;
+  if (next.event_id === previous.event_id) return next.ts > previous.ts;
+  const nextDepth = depths.get(next.event_id);
+  const previousDepth = depths.get(previous.event_id);
+  if (nextDepth !== undefined && previousDepth !== undefined && nextDepth !== previousDepth) return nextDepth > previousDepth;
+  return next.ts >= previous.ts;
+}
+
+// The durable room cache serves sync; this relational copy lets notification
+// evaluation combine public/private read positions without changing m.fully_read.
+export async function recordReadReceipts(db: D1Database, roomId: string, receipts: ReadReceipt[]): Promise<void> {
+  for (let i = 0; i < receipts.length; i += 40) {
+    await db.batch(receipts.slice(i, i + 40).flatMap(receipt => [
+      db.prepare(`INSERT INTO receipts(room_id,user_id,receipt_type,event_id,thread_id,ts) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(room_id,user_id,receipt_type,thread_id) DO UPDATE SET event_id=excluded.event_id,ts=excluded.ts
+        WHERE CASE
+          WHEN excluded.event_id=receipts.event_id THEN excluded.ts>receipts.ts
+          WHEN (SELECT depth FROM events WHERE event_id=excluded.event_id AND room_id=excluded.room_id)>
+               (SELECT depth FROM events WHERE event_id=receipts.event_id AND room_id=receipts.room_id) THEN 1
+          WHEN (SELECT depth FROM events WHERE event_id=excluded.event_id AND room_id=excluded.room_id)<
+               (SELECT depth FROM events WHERE event_id=receipts.event_id AND room_id=receipts.room_id) THEN 0
+          ELSE excluded.ts>=receipts.ts END`)
+        .bind(roomId, receipt.user_id, receipt.receipt_type, receipt.event_id, receipt.thread_id ?? '', receipt.ts),
+      db.prepare(`INSERT INTO stream_positions(stream_name,position) SELECT 'receipts',1 WHERE changes()>0
+        ON CONFLICT(stream_name) DO UPDATE SET position=position+1`),
+    ]));
+  }
 }
 
 export async function notifyReceiptUsers(env: Env, roomId: string, privateUser?: string): Promise<void> {
@@ -52,20 +92,28 @@ export async function queueReadReceipt(env: Env, roomId: string, receipt: ReadRe
   }
 }
 
-export async function storeReadReceipt(env: Env, roomId: string, receipt: ReadReceipt): Promise<boolean> {
+async function storeEffectiveReadReceipt(env: Env, roomId: string, receipt: ReadReceipt): Promise<{ updated: boolean; receipt: ReadReceipt }> {
   const response = await env.ROOMS.get(env.ROOMS.idFromName(roomId)).fetch(new Request('https://room/receipt', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...receipt, room_id: roomId }),
   }));
   if (!response.ok) throw new Error('Could not store read receipt');
-  const result = await response.json() as { updated: boolean };
-  return result.updated;
+  const result = await response.json() as { updated: boolean; receipt: ReadReceipt };
+  if (typeof result.updated !== 'boolean' || !isObject(result.receipt) ||
+      result.receipt.user_id !== receipt.user_id || result.receipt.receipt_type !== receipt.receipt_type ||
+      result.receipt.thread_id !== receipt.thread_id || typeof result.receipt.event_id !== 'string' ||
+      !Number.isSafeInteger(result.receipt.ts) || result.receipt.ts < 0) throw new Error('Invalid stored read receipt');
+  return result;
+}
+
+export async function storeReadReceipt(env: Env, roomId: string, receipt: ReadReceipt): Promise<boolean> {
+  return (await storeEffectiveReadReceipt(env, roomId, receipt)).updated;
 }
 
 export async function publishReadReceipt(env: Env, roomId: string, receipt: ReadReceipt): Promise<void> {
-  await storeReadReceipt(env, roomId, receipt);
+  const effective = (await storeEffectiveReadReceipt(env, roomId, receipt)).receipt;
   // A retry must also retry delivery, even if the receipt was already stored.
-  await queueReadReceipt(env, roomId, receipt);
-  await notifyReceiptUsers(env, roomId, receipt.receipt_type === 'm.read.private' ? receipt.user_id : undefined);
+  await queueReadReceipt(env, roomId, effective);
+  await notifyReceiptUsers(env, roomId, effective.receipt_type === 'm.read.private' ? effective.user_id : undefined);
 }
 
 // Federation receipts use room -> type -> user -> {event_ids,data}, unlike the

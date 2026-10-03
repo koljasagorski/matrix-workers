@@ -2,7 +2,7 @@
 
 import { Hono } from 'hono';
 import type { AppEnv, PDU } from '../types';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
@@ -12,17 +12,20 @@ import {
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoomState } from '../services/database';
-import { eventVerifier, isObject } from '../services/federation-events';
+import { eventVerifier, isObject, redactEvent, wireEvent } from '../services/federation-events';
 import { parseUserId } from '../utils/ids';
 import { getRoom, getEvent, getEventsByIds, storeEvent, updateMembership, notifyUsersOfEvent } from '../services/database';
 import { validateJoinGraph } from '../services/remote-rooms';
 import { storeDeviceMessage, wakeDeviceSync } from '../services/device-messages';
-import { federationGet } from '../services/federation-keys';
+import { federationGet, getServerSigningKey } from '../services/federation-keys';
 import { readFederationJson } from '../services/federation-http';
 import { federationMediaResponse } from '../services/federation-media';
 import { receiveRemoteInvite } from '../services/remote-invites';
 import { receiveReadReceipts } from '../services/read-receipts';
 import { isServerAllowedInRoom } from '../services/server-acl';
+import { persistLocalRoomEvent, selectAuthEvents } from '../services/local-room-events';
+import { getSnapshotEventsByIds, getStateBeforeEvent } from '../services/event-state-snapshots';
+import { prepareRestrictedJoinContent } from '../services/restricted-joins';
 
 const app = new Hono<AppEnv>();
 
@@ -734,873 +737,283 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   return c.json(response);
 });
 
-// GET /_matrix/federation/v1/event/:eventId - Get a single event
-app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
-  const eventId = c.req.param('eventId');
-
-  const event = await c.env.DB.prepare(
-    `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-     FROM events WHERE event_id = ?`
-  ).bind(eventId).first<{
-    event_id: string;
-    room_id: string;
-    sender: string;
-    event_type: string;
-    state_key: string | null;
-    content: string;
-    origin_server_ts: number;
-    depth: number;
-    auth_events: string;
-    prev_events: string;
-    hashes: string | null;
-    signatures: string | null;
-  }>();
-
-  if (!event) {
-    return Errors.notFound('Event not found').toResponse();
+// Room-scoped helpers preserve complete signed wire events and bound graph traversal.
+const MAX_FEDERATION_GRAPH_EVENTS = 10000;
+async function federationAuthChain(db: D1Database, roomId: string, roots: string[]): Promise<PDU[]> {
+  const pending = [...new Set(roots)];
+  const visited = new Set<string>();
+  const chain: PDU[] = [];
+  while (pending.length) {
+    const ids = [...new Set(pending.splice(0, 100))].filter(id => !visited.has(id));
+    if (!ids.length) continue;
+    for (const id of ids) visited.add(id);
+    if (visited.size > MAX_FEDERATION_GRAPH_EVENTS) throw Errors.tooLarge('Room auth chain exceeds the traversal limit');
+    const events = await getSnapshotEventsByIds(db, roomId, ids);
+    if (events.length !== ids.length) throw Errors.notFound('Room auth chain is incomplete');
+    for (const event of events) {
+      if (event.room_id !== roomId) throw Errors.forbidden('Auth event belongs to another room');
+      chain.push(event);
+      for (const id of event.auth_events) if (!visited.has(id)) pending.push(id);
+    }
   }
+  return chain;
+}
+function authChainRoots(state: PDU[], version: string, extra: string[] = []): string[] {
+  const create = state.find(event => event.type === 'm.room.create');
+  return [...state.flatMap(event => event.auth_events), ...extra,
+    ...(version === '12' && create ? [create.event_id] : [])];
+}
+function membershipEventAuthorization(event: PDU, declared: PDU[], create: PDU | undefined, version: string) {
+  const allowed = new Set(['m.room.create', 'm.room.member', 'm.room.power_levels', 'm.room.join_rules', 'm.room.third_party_invite']);
+  const pairs = declared.map(candidate => `${candidate.type}\0${candidate.state_key}`);
+  if (new Set(event.auth_events).size !== event.auth_events.length || declared.length !== event.auth_events.length
+      || new Set(pairs).size !== pairs.length || declared.some(candidate => candidate.room_id !== event.room_id
+        || candidate.state_key === undefined || !allowed.has(candidate.type) || (version === '12' && candidate.type === 'm.room.create'))) {
+    return { allowed: false, error: 'Invalid membership authorization events' };
+  }
+  return checkEventAuth(event, version === '12' && create ? [...declared, create] : declared, version);
+}
+async function previousFederationEvents(
+  db: D1Database, roomId: string, roots: PDU[], earliest: string[], limit: number, minDepth = 0
+): Promise<PDU[]> {
+  const visited = new Set([...earliest, ...roots.map(event => event.event_id)]);
+  const pending = roots.flatMap(event => event.prev_events);
+  const events: PDU[] = [];
+  while (pending.length && events.length < limit) {
+    const ids = [...new Set(pending.splice(0, Math.min(100, limit - events.length)))].filter(id => !visited.has(id));
+    if (!ids.length) continue;
+    for (const id of ids) visited.add(id);
+    if (visited.size > MAX_FEDERATION_GRAPH_EVENTS) throw Errors.tooLarge('Event graph exceeds the traversal limit');
+    for (const event of await getEventsByIds(db, ids)) {
+      if (event.room_id !== roomId || event.depth < minDepth) continue;
+      events.push(event);
+      for (const id of event.prev_events) if (!visited.has(id)) pending.push(id);
+    }
+  }
+  return events.sort((a, b) => b.depth - a.depth || a.event_id.localeCompare(b.event_id));
+}
 
-  const pdu: PDU = {
-    event_id: event.event_id,
-    room_id: event.room_id,
-    sender: event.sender,
-    type: event.event_type,
-    state_key: event.state_key ?? undefined,
-    content: JSON.parse(event.content),
-    origin_server_ts: event.origin_server_ts,
-    depth: event.depth,
-    auth_events: JSON.parse(event.auth_events),
-    prev_events: JSON.parse(event.prev_events),
-    hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
-    signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
-  };
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    origin_server_ts: Date.now(),
-    pdus: [pdu],
-  });
+// GET /_matrix/federation/v1/event/:eventId - Get a single signed wire event
+app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
+  const event = await getEvent(c.env.DB, c.req.param('eventId'));
+  if (!event) return Errors.notFound('Event not found').toResponse();
+  const room = await getRoom(c.env.DB, event.room_id);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  return c.json({ origin: c.env.SERVER_NAME, origin_server_ts: Date.now(), pdus: [wireEvent(event, room.room_version)] });
 });
 
-// GET /_matrix/federation/v1/state/:roomId - Get room state
+// GET /_matrix/federation/v1/state/:roomId - Get room state and its complete auth chain
 app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
-  // Note: eventId could be used to get state at a specific point in time
-  void c.req.query('event_id');
-
-  // Get current room state
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.depth, e.auth_events, e.prev_events
-     FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all<{
-    event_id: string;
-    room_id: string;
-    sender: string;
-    event_type: string;
-    state_key: string | null;
-    content: string;
-    origin_server_ts: number;
-    depth: number;
-    auth_events: string;
-    prev_events: string;
-  }>();
-
-  const pdus = stateEvents.results.map(e => ({
-    event_id: e.event_id,
-    room_id: e.room_id,
-    sender: e.sender,
-    type: e.event_type,
-    state_key: e.state_key ?? '',
-    content: JSON.parse(e.content),
-    origin_server_ts: e.origin_server_ts,
-    depth: e.depth,
-    auth_events: JSON.parse(e.auth_events),
-    prev_events: JSON.parse(e.prev_events),
-  }));
-
-  // Get auth chain
-  const authEventIds = new Set<string>();
-  for (const pdu of pdus) {
-    for (const authId of pdu.auth_events) {
-      authEventIds.add(authId);
-    }
-  }
-
-  const authChain: any[] = [];
-  for (const authId of authEventIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        ...authEvent,
-        type: (authEvent as any).event_type,
-        content: JSON.parse((authEvent as any).content),
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-      });
-    }
-  }
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    origin_server_ts: Date.now(),
-    pdus,
-    auth_chain: authChain,
-  });
-});
-
-// GET /_matrix/federation/v1/state_ids/:roomId - Get room state event IDs only
-app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.query('event_id');
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Get state event IDs
-  let stateEventIds: string[];
-  let authChainIds: string[];
-
-  if (eventId) {
-    // Get state at a specific event
-    // For now, we get current state - proper implementation would track state snapshots
-    const stateEvents = await c.env.DB.prepare(
-      `SELECT e.event_id, e.auth_events
-       FROM room_state rs
-       JOIN events e ON rs.event_id = e.event_id
-       WHERE rs.room_id = ?`
-    ).bind(roomId).all<{ event_id: string; auth_events: string }>();
-
-    stateEventIds = stateEvents.results.map(e => e.event_id);
-
-    // Collect auth chain IDs
-    const authChainSet = new Set<string>();
-    for (const event of stateEvents.results) {
-      const authEvents = JSON.parse(event.auth_events) as string[];
-      for (const authId of authEvents) {
-        authChainSet.add(authId);
-      }
-    }
-    authChainIds = Array.from(authChainSet);
-  } else {
-    // Get current state
-    const stateEvents = await c.env.DB.prepare(
-      `SELECT e.event_id, e.auth_events
-       FROM room_state rs
-       JOIN events e ON rs.event_id = e.event_id
-       WHERE rs.room_id = ?`
-    ).bind(roomId).all<{ event_id: string; auth_events: string }>();
-
-    stateEventIds = stateEvents.results.map(e => e.event_id);
-
-    // Collect auth chain IDs
-    const authChainSet = new Set<string>();
-    for (const event of stateEvents.results) {
-      const authEvents = JSON.parse(event.auth_events) as string[];
-      for (const authId of authEvents) {
-        authChainSet.add(authId);
-      }
-    }
-    authChainIds = Array.from(authChainSet);
-  }
-
-  return c.json({
-    pdu_ids: stateEventIds,
-    auth_chain_ids: authChainIds,
-  });
-});
-
-// GET /_matrix/federation/v1/event_auth/:roomId/:eventId - Get auth chain for an event
-app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Get the event
-  const event = await c.env.DB.prepare(
-    `SELECT event_id, auth_events FROM events WHERE event_id = ? AND room_id = ?`
-  ).bind(eventId, roomId).first<{ event_id: string; auth_events: string }>();
-
-  if (!event) {
-    return Errors.notFound('Event not found').toResponse();
-  }
-
-  // Build auth chain by recursively collecting auth events
-  const authChain: PDU[] = [];
-  const visited = new Set<string>();
-  const toProcess = JSON.parse(event.auth_events) as string[];
-
-  while (toProcess.length > 0) {
-    const authId = toProcess.shift()!;
-    if (visited.has(authId)) continue;
-    visited.add(authId);
-
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first<{
-      event_id: string;
-      room_id: string;
-      sender: string;
-      event_type: string;
-      state_key: string | null;
-      content: string;
-      origin_server_ts: number;
-      depth: number;
-      auth_events: string;
-      prev_events: string;
-      hashes: string | null;
-      signatures: string | null;
-    }>();
-
-    if (authEvent) {
-      authChain.push({
-        event_id: authEvent.event_id,
-        room_id: authEvent.room_id,
-        sender: authEvent.sender,
-        type: authEvent.event_type,
-        state_key: authEvent.state_key ?? undefined,
-        content: JSON.parse(authEvent.content),
-        origin_server_ts: authEvent.origin_server_ts,
-        depth: authEvent.depth,
-        auth_events: JSON.parse(authEvent.auth_events),
-        prev_events: JSON.parse(authEvent.prev_events),
-        hashes: authEvent.hashes ? JSON.parse(authEvent.hashes) : undefined,
-        signatures: authEvent.signatures ? JSON.parse(authEvent.signatures) : undefined,
-      });
-
-      // Add this event's auth_events to process
-      const moreAuthEvents = JSON.parse(authEvent.auth_events) as string[];
-      for (const id of moreAuthEvents) {
-        if (!visited.has(id)) {
-          toProcess.push(id);
-        }
-      }
-    }
-  }
-
-  return c.json({
-    auth_chain: authChain,
-  });
-});
-
-// GET /_matrix/federation/v1/backfill/:roomId - Fetch historical events
-app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const limit = Math.min(parseInt(c.req.query('limit') || '100', 10), 1000);
-  const vParam = c.req.query('v'); // Starting event IDs
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Parse starting event IDs
-  const startEventIds = vParam ? vParam.split(',') : [];
-
-  let events: any[];
-  if (startEventIds.length > 0) {
-    // Get events before the specified events
-    const startEvents = await c.env.DB.prepare(
-      `SELECT MIN(depth) as min_depth FROM events WHERE event_id IN (${startEventIds.map(() => '?').join(',')})`
-    ).bind(...startEventIds).first<{ min_depth: number }>();
-
-    const maxDepth = startEvents?.min_depth || 0;
-
-    events = (await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events
-       WHERE room_id = ? AND depth < ?
-       ORDER BY depth DESC
-       LIMIT ?`
-    ).bind(roomId, maxDepth, limit).all()).results;
-  } else {
-    // Get most recent events
-    events = (await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events
-       WHERE room_id = ?
-       ORDER BY depth DESC
-       LIMIT ?`
-    ).bind(roomId, limit).all()).results;
-  }
-
-  const pdus = events.map((e: any) => ({
-    event_id: e.event_id,
-    room_id: e.room_id,
-    sender: e.sender,
-    type: e.event_type,
-    state_key: e.state_key ?? undefined,
-    content: JSON.parse(e.content),
-    origin_server_ts: e.origin_server_ts,
-    depth: e.depth,
-    auth_events: JSON.parse(e.auth_events),
-    prev_events: JSON.parse(e.prev_events),
-    hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-    signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-  }));
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    origin_server_ts: Date.now(),
-    pdus,
-  });
-});
-
-// POST /_matrix/federation/v1/get_missing_events/:roomId - Fill event gaps
-app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
-  const roomId = c.req.param('roomId');
-
-  let body: {
-    earliest_events?: string[];
-    latest_events?: string[];
-    limit?: number;
-    min_depth?: number;
-  };
-
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  const earliestEvents = body.earliest_events || [];
-  const latestEvents = body.latest_events || [];
-  const limit = Math.min(body.limit || 10, 100);
-  const minDepth = body.min_depth || 0;
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Walk backwards from latest_events to earliest_events
-  const events: any[] = [];
-  const visited = new Set<string>(earliestEvents);
-  const toProcess = [...latestEvents];
-
-  while (toProcess.length > 0 && events.length < limit) {
-    const eventId = toProcess.shift()!;
-    if (visited.has(eventId)) continue;
-    visited.add(eventId);
-
-    const event = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events
-       WHERE event_id = ? AND room_id = ? AND depth >= ?`
-    ).bind(eventId, roomId, minDepth).first<{
-      event_id: string;
-      room_id: string;
-      sender: string;
-      event_type: string;
-      state_key: string | null;
-      content: string;
-      origin_server_ts: number;
-      depth: number;
-      auth_events: string;
-      prev_events: string;
-      hashes: string | null;
-      signatures: string | null;
-    }>();
-
-    if (event) {
-      events.push({
-        event_id: event.event_id,
-        room_id: event.room_id,
-        sender: event.sender,
-        type: event.event_type,
-        state_key: event.state_key ?? undefined,
-        content: JSON.parse(event.content),
-        origin_server_ts: event.origin_server_ts,
-        depth: event.depth,
-        auth_events: JSON.parse(event.auth_events),
-        prev_events: JSON.parse(event.prev_events),
-        hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
-        signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
-      });
-
-      // Add prev_events to process
-      const prevEvents = JSON.parse(event.prev_events) as string[];
-      for (const prevId of prevEvents) {
-        if (!visited.has(prevId)) {
-          toProcess.push(prevId);
-        }
-      }
-    }
-  }
-
-  return c.json({
-    events,
-  });
-});
-
-// POST /_matrix/federation/v1/make_join/:roomId/:userId - Prepare join request
-app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const userId = c.req.param('userId');
-
-  // Check if room exists and is joinable
-  const room = await c.env.DB.prepare(
-    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Get current room state for auth events
-  const createEvent = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
-  ).bind(roomId).first<{ event_id: string }>();
-
-  const joinRulesEvent = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.join_rules'`
-  ).bind(roomId).first<{ event_id: string }>();
-
-  const powerLevelsEvent = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'`
-  ).bind(roomId).first<{ event_id: string }>();
-
-  const authEvents: string[] = [];
-  if (createEvent) authEvents.push(createEvent.event_id);
-  if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
-  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
-
-  // Get latest event for prev_events
-  const latestEvent = await c.env.DB.prepare(
-    `SELECT event_id, depth FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1`
-  ).bind(roomId).first<{ event_id: string; depth: number }>();
-
-  const prevEvents = latestEvent ? [latestEvent.event_id] : [];
-  const depth = (latestEvent?.depth || 0) + 1;
-
-  // Create unsigned join event template
-  const eventTemplate = {
-    room_id: roomId,
-    sender: userId,
-    type: 'm.room.member',
-    state_key: userId,
-    content: {
-      membership: 'join',
-    },
-    origin_server_ts: Date.now(),
-    depth,
-    auth_events: authEvents,
-    prev_events: prevEvents,
-  };
-
-  return c.json({
-    room_version: room.room_version,
-    event: eventTemplate,
-  });
-});
-
-for (const version of ['v1', 'v2']) app.use(`/_matrix/federation/${version}/send_join/:roomId/:eventId`, async (c, next) => {
-  const roomId = c.req.param('roomId')!;
   const room = await getRoom(c.env.DB, roomId);
   if (!room) return Errors.notFound('Room not found').toResponse();
+  const eventId = c.req.query('event_id');
   try {
-    const body = await c.req.json();
-    const event = await eventVerifier(c.env)(body, room.room_version, roomId);
-    if (event.event_id !== c.req.param('eventId') || event.type !== 'm.room.member' ||
-        event.content.membership !== 'join' || event.sender !== event.state_key ||
-        parseUserId(event.sender)?.serverName !== c.get('federationOrigin' as any)) {
+    const state = eventId ? await getStateBeforeEvent(c.env.DB, roomId, eventId) : await getRoomState(c.env.DB, roomId);
+    const auth = await federationAuthChain(c.env.DB, roomId, authChainRoots(state, room.room_version));
+    return c.json({ origin: c.env.SERVER_NAME, origin_server_ts: Date.now(),
+      pdus: state.map(event => wireEvent(event, room.room_version)), auth_chain: auth.map(event => wireEvent(event, room.room_version)) });
+  } catch (error) { if (error instanceof MatrixApiError) return error.toResponse(); throw error; }
+});
+
+app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
+  const roomId = c.req.param('roomId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const eventId = c.req.query('event_id');
+  try {
+    const state = eventId ? await getStateBeforeEvent(c.env.DB, roomId, eventId) : await getRoomState(c.env.DB, roomId);
+    const auth = await federationAuthChain(c.env.DB, roomId, authChainRoots(state, room.room_version));
+    return c.json({ pdu_ids: state.map(event => event.event_id), auth_chain_ids: auth.map(event => event.event_id) });
+  } catch (error) { if (error instanceof MatrixApiError) return error.toResponse(); throw error; }
+});
+
+app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
+  const roomId = c.req.param('roomId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const event = await getEvent(c.env.DB, c.req.param('eventId'));
+  if (!event || event.room_id !== roomId) return Errors.notFound('Event not found in room').toResponse();
+  const createId = room.room_version === '12' && event.type !== 'm.room.create' ? `$${roomId.slice(1)}` : undefined;
+  const auth = await federationAuthChain(c.env.DB, roomId, [...event.auth_events, ...(createId ? [createId] : [])]);
+  return c.json({ auth_chain: auth.map(event => wireEvent(event, room.room_version)) });
+});
+
+app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
+  const roomId = c.req.param('roomId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const limit = Number(c.req.query('limit') ?? 100);
+  if (!Number.isSafeInteger(limit) || limit < 1) return Errors.invalidParam('limit').toResponse();
+  const ids = [...new Set((c.req.queries('v') ?? []).flatMap(value => value.split(',')))];
+  if (ids.length > 100 || ids.some(id => !id)) return Errors.invalidParam('v').toResponse();
+  let events: PDU[];
+  if (ids.length) {
+    const roots = (await getEventsByIds(c.env.DB, ids)).filter(event => event.room_id === roomId);
+    if (!roots.length) return Errors.notFound('Starting events not found in room').toResponse();
+    events = await previousFederationEvents(c.env.DB, roomId, roots, [], Math.min(limit, 1000));
+  } else {
+    const rows = await c.env.DB.prepare('SELECT event_id FROM events WHERE room_id=? ORDER BY depth DESC,event_id LIMIT ?')
+      .bind(roomId, Math.min(limit, 1000)).all<{ event_id: string }>();
+    events = [];
+    for (let offset = 0; offset < rows.results.length; offset += 100) {
+      events.push(...await getEventsByIds(c.env.DB, rows.results.slice(offset, offset + 100).map(row => row.event_id)));
+    }
+    events.sort((a, b) => b.depth - a.depth || a.event_id.localeCompare(b.event_id));
+  }
+  return c.json({ origin: c.env.SERVER_NAME, origin_server_ts: Date.now(), pdus: events.map(event => wireEvent(event, room.room_version)) });
+});
+
+app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
+  const roomId = c.req.param('roomId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return Errors.badJson().toResponse(); }
+  if (!isObject(body)) return Errors.badJson('Expected an object').toResponse();
+  const earliest = body.earliest_events ?? [];
+  const latest = body.latest_events ?? [];
+  const limit = body.limit ?? 10;
+  const minDepth = body.min_depth ?? 0;
+  if (!Array.isArray(earliest) || earliest.length > 1000 || !earliest.every(id => typeof id === 'string') ||
+      !Array.isArray(latest) || latest.length > 100 || !latest.every(id => typeof id === 'string') ||
+      !Number.isSafeInteger(limit) || Number(limit) < 1 || !Number.isSafeInteger(minDepth) || Number(minDepth) < 0) {
+    return Errors.invalidParam('events, limit or min_depth').toResponse();
+  }
+  const roots = (await getEventsByIds(c.env.DB, [...new Set(latest as string[])])).filter(event => event.room_id === roomId);
+  const events = await previousFederationEvents(c.env.DB, roomId, roots, earliest as string[], Math.min(Number(limit), 100), Number(minDepth));
+  return c.json({ events: events.map(event => wireEvent(event, room.room_version)) });
+});
+
+async function membershipTemplate(env: AppEnv['Bindings'], roomId: string, userId: string, state: PDU[], version: string, membership: 'join' | 'leave', content: Record<string, unknown> = { membership }): Promise<PDU> {
+  const latest = await env.DB.prepare('SELECT event_id,depth FROM events WHERE room_id=? ORDER BY depth DESC,stream_ordering DESC LIMIT 1')
+    .bind(roomId).first<{ event_id: string; depth: number }>();
+  return { event_id: '', room_id: roomId, sender: userId, state_key: userId, type: 'm.room.member',
+    content, origin_server_ts: Date.now(), depth: Math.min((latest?.depth ?? 0) + 1, Number.MAX_SAFE_INTEGER),
+    auth_events: selectAuthEvents(state, { roomId, sender: userId, stateKey: userId, type: 'm.room.member', content }, version),
+    prev_events: latest ? [latest.event_id] : [] };
+}
+
+app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
+  const roomId = c.req.param('roomId'); const userId = c.req.param('userId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  if (!(c.req.queries('ver') ?? ['1']).includes(room.room_version)) return c.json({ errcode: 'M_INCOMPATIBLE_ROOM_VERSION', error: 'Room version is not supported by the joining server', room_version: room.room_version }, 400);
+  const origin = c.get('federationOrigin' as any) as string;
+  if (parseUserId(userId)?.serverName !== origin || !await isServerAllowedInRoom(c.env.DB, roomId, origin)) return Errors.forbidden('Invalid or disallowed joining server').toResponse();
+  const state = await getRoomState(c.env.DB, roomId);
+  let content: Record<string, unknown>;
+  try { content = await prepareRestrictedJoinContent(c.env, roomId, userId, { membership: 'join' }, state, room.room_version); }
+  catch (error) { if (error instanceof MatrixApiError) return error.toResponse(); throw error; }
+  const event = await membershipTemplate(c.env, roomId, userId, state, room.room_version, 'join', content);
+  const auth = checkEventAuth(event, state, room.room_version);
+  if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
+  return c.json({ room_version: room.room_version, event: wireEvent(event, room.room_version) });
+});
+
+for (const apiVersion of ['v1', 'v2']) app.put(`/_matrix/federation/${apiVersion}/send_join/:roomId/:eventId`, async (c) => {
+  const roomId = c.req.param('roomId')!; const eventId = c.req.param('eventId')!;
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const origin = c.get('federationOrigin' as any) as string;
+  if (!await isServerAllowedInRoom(c.env.DB, roomId, origin)) return Errors.forbidden('Origin server is denied by the room ACL').toResponse();
+  const existing = await getEvent(c.env.DB, eventId);
+  let state = await getRoomState(c.env.DB, roomId);
+  let event: PDU;
+  try {
+    let raw: unknown = await c.req.json();
+    if (!isObject(raw) || !isObject(raw.content) || raw.type !== 'm.room.member' || raw.sender !== raw.state_key ||
+        typeof raw.sender !== 'string' || parseUserId(raw.sender)?.serverName !== origin || raw.content.membership !== 'join') {
       return Errors.forbidden('Invalid join event').toResponse();
     }
-    const auth = checkEventAuth(event, await getRoomState(c.env.DB, roomId), room.room_version);
-    if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
-    if (!await getEvent(c.env.DB, event.event_id)) await storeEvent(c.env.DB, event);
-    await updateMembership(c.env.DB, roomId, event.sender, 'join', event.event_id);
-    return next();
-  } catch { return Errors.forbidden('Invalid or unsigned join event').toResponse(); }
-});
-
-// PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join
-app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Get current state and auth chain
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.* FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all();
-
-  // Build auth chain
-  const authChainIds = new Set<string>();
-  for (const event of stateEvents.results) {
-    const authEvents = JSON.parse((event as any).auth_events) as string[];
-    for (const authId of authEvents) {
-      authChainIds.add(authId);
-    }
-  }
-
-  const authChain: any[] = [];
-  for (const authId of authChainIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        event_id: (authEvent as any).event_id,
-        room_id: (authEvent as any).room_id,
-        sender: (authEvent as any).sender,
-        type: (authEvent as any).event_type,
-        state_key: (authEvent as any).state_key ?? undefined,
-        content: JSON.parse((authEvent as any).content),
-        origin_server_ts: (authEvent as any).origin_server_ts,
-        depth: (authEvent as any).depth,
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
-        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
-      });
-    }
-  }
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
-      event_id: e.event_id,
-      room_id: e.room_id,
-      sender: e.sender,
-      type: e.event_type,
-      state_key: e.state_key ?? undefined,
-      content: JSON.parse(e.content),
-      origin_server_ts: e.origin_server_ts,
-      depth: e.depth,
-      auth_events: JSON.parse(e.auth_events),
-      prev_events: JSON.parse(e.prev_events),
-      hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-      signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
-  });
-});
-
-// PUT /_matrix/federation/v2/send_join/:roomId/:eventId - Complete join (v2)
-// v2 wraps response in { event, state, auth_chain, ... } instead of returning array
-app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Get room info
-  const room = await c.env.DB.prepare(
-    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Get current state and auth chain
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.* FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all();
-
-  // Build auth chain
-  const authChainIds = new Set<string>();
-  for (const event of stateEvents.results) {
-    const authEvents = JSON.parse((event as any).auth_events) as string[];
-    for (const authId of authEvents) {
-      authChainIds.add(authId);
-    }
-  }
-
-  const authChain: any[] = [];
-  for (const authId of authChainIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        event_id: (authEvent as any).event_id,
-        room_id: (authEvent as any).room_id,
-        sender: (authEvent as any).sender,
-        type: (authEvent as any).event_type,
-        state_key: (authEvent as any).state_key ?? undefined,
-        content: JSON.parse((authEvent as any).content),
-        origin_server_ts: (authEvent as any).origin_server_ts,
-        depth: (authEvent as any).depth,
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
-        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
-      });
-    }
-  }
-
-  // v2 returns servers_in_room for restricted joins
-  const serversInRoom = new Set<string>();
-  for (const event of stateEvents.results) {
-    if ((event as any).event_type === 'm.room.member') {
-      const content = JSON.parse((event as any).content);
-      if (content.membership === 'join') {
-        const sender = (event as any).sender as string;
-        const serverName = sender.split(':')[1];
-        if (serverName) serversInRoom.add(serverName);
+    if (!existing) {
+      const permitted = await prepareRestrictedJoinContent(c.env, roomId, raw.sender, raw.content, state, room.room_version);
+      if (permitted.join_authorised_via_users_server !== raw.content.join_authorised_via_users_server) {
+        return Errors.forbidden('Invalid restricted join authorizer').toResponse();
       }
     }
+    if (typeof raw.content.join_authorised_via_users_server === 'string') {
+      if (parseUserId(raw.content.join_authorised_via_users_server)?.serverName !== c.env.SERVER_NAME ||
+          (existing && (existing.room_id !== roomId || existing.content.join_authorised_via_users_server !== raw.content.join_authorised_via_users_server))) {
+        return Errors.forbidden('Restricted join authorizer must belong to this server').toResponse();
+      }
+      const key = await getServerSigningKey(c.env.DB);
+      if (!key) throw new Error('Server signing key unavailable');
+      // Add the resident signature to the unchanged event: rehashing would invalidate
+      // the peer's signature and the event reference ID.
+      const signed = await signJson(redactEvent(wireEvent(raw as unknown as PDU, room.room_version), room.room_version), c.env.SERVER_NAME, key.keyId, key.privateKeyJwk);
+      raw = { ...raw, signatures: signed.signatures };
+    }
+    event = await eventVerifier(c.env)(raw, room.room_version, roomId);
+  } catch (error) {
+    if (error instanceof MatrixApiError) return error.toResponse();
+    return Errors.forbidden('Invalid or unsigned join event').toResponse();
   }
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
-      event_id: e.event_id,
-      room_id: e.room_id,
-      sender: e.sender,
-      type: e.event_type,
-      state_key: e.state_key ?? undefined,
-      content: JSON.parse(e.content),
-      origin_server_ts: e.origin_server_ts,
-      depth: e.depth,
-      auth_events: JSON.parse(e.auth_events),
-      prev_events: JSON.parse(e.prev_events),
-      hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-      signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
-    members_omitted: false,
-    servers_in_room: Array.from(serversInRoom),
-  });
+  if (event.event_id !== eventId || event.type !== 'm.room.member' || event.content.membership !== 'join'
+      || event.sender !== event.state_key || parseUserId(event.sender)?.serverName !== origin) return Errors.forbidden('Invalid join event').toResponse();
+  const cacheKey = `federation:send-join-response:${roomId}:${eventId}`;
+  const cached = existing ? await c.env.CACHE.get(cacheKey, 'json') : null;
+  if (cached) return c.json(apiVersion === 'v1' ? [200, cached] : cached);
+  if (!existing) {
+    const auth = checkEventAuth(event, state, room.room_version);
+    if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
+  } else {
+    // A retry must return the original pre-join state even after the cache expires
+    // and later room state has changed.
+    try { state = await getStateBeforeEvent(c.env.DB, roomId, eventId); }
+    catch (error) { if (error instanceof MatrixApiError) return error.toResponse(); throw error; }
+  }
+  const auth = await federationAuthChain(c.env.DB, roomId, authChainRoots(state, room.room_version, event.auth_events));
+  const declared = auth.filter(candidate => event.auth_events.includes(candidate.event_id));
+  const create = state.find(candidate => candidate.type === 'm.room.create');
+  const authorization = membershipEventAuthorization(event, declared, create, room.room_version);
+  if (!authorization.allowed) return Errors.forbidden(authorization.error).toResponse();
+  const servers = [...new Set(state.filter(stateEvent => stateEvent.type === 'm.room.member' && stateEvent.content.membership === 'join')
+    .map(stateEvent => parseUserId(stateEvent.state_key ?? '')?.serverName).filter((server): server is string => !!server))];
+  const response = { origin: c.env.SERVER_NAME, state: state.map(stateEvent => wireEvent(stateEvent, room.room_version)),
+    auth_chain: auth.map(authEvent => wireEvent(authEvent, room.room_version)), event: wireEvent(event, room.room_version),
+    members_omitted: false, servers_in_room: servers };
+  // Persist the pre-join response before changing membership, so retries return the same graph.
+  await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 3600 });
+  if (!existing) await persistLocalRoomEvent(c.env, event, room.room_version);
+  return c.json(apiVersion === 'v1' ? [200, response] : response);
 });
 
-// GET /_matrix/federation/v1/make_leave/:roomId/:userId - Prepare leave request
 app.get('/_matrix/federation/v1/make_leave/:roomId/:userId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const userId = c.req.param('userId');
-
-  // Check if room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // Check if user is a member of the room
-  const membership = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.member' AND rs.state_key = ?`
-  ).bind(roomId, userId).first<{ event_id: string }>();
-
-  if (!membership) {
-    return c.json(
-      { errcode: 'M_FORBIDDEN', error: 'User is not a member of the room' },
-      403
-    );
-  }
-
-  // Get auth events for leave
-  const createEvent = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
-  ).bind(roomId).first<{ event_id: string }>();
-
-  const powerLevelsEvent = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'`
-  ).bind(roomId).first<{ event_id: string }>();
-
-  const authEvents: string[] = [];
-  if (createEvent) authEvents.push(createEvent.event_id);
-  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
-  if (membership) authEvents.push(membership.event_id);
-
-  // Get latest event for prev_events
-  const latestEvent = await c.env.DB.prepare(
-    `SELECT event_id, depth FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1`
-  ).bind(roomId).first<{ event_id: string; depth: number }>();
-
-  const prevEvents = latestEvent ? [latestEvent.event_id] : [];
-  const depth = (latestEvent?.depth || 0) + 1;
-
-  // Create unsigned leave event template
-  const eventTemplate = {
-    room_id: roomId,
-    sender: userId,
-    type: 'm.room.member',
-    state_key: userId,
-    content: {
-      membership: 'leave',
-    },
-    origin_server_ts: Date.now(),
-    depth,
-    auth_events: authEvents,
-    prev_events: prevEvents,
-  };
-
-  return c.json({
-    room_version: room.room_version,
-    event: eventTemplate,
-  });
+  const roomId = c.req.param('roomId'); const userId = c.req.param('userId');
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const origin = c.get('federationOrigin' as any) as string;
+  if (parseUserId(userId)?.serverName !== origin || !await isServerAllowedInRoom(c.env.DB, roomId, origin)) return Errors.forbidden('Invalid or disallowed leaving server').toResponse();
+  const state = await getRoomState(c.env.DB, roomId);
+  const event = await membershipTemplate(c.env, roomId, userId, state, room.room_version, 'leave');
+  const auth = checkEventAuth(event, state, room.room_version);
+  if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
+  return c.json({ room_version: room.room_version, event: wireEvent(event, room.room_version) });
 });
 
-// PUT /_matrix/federation/v1/send_leave/:roomId/:eventId - Complete leave
-app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
+for (const apiVersion of ['v1', 'v2']) app.put(`/_matrix/federation/${apiVersion}/send_leave/:roomId/:eventId`, async (c) => {
+  const roomId = c.req.param('roomId')!; const eventId = c.req.param('eventId')!;
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  const origin = c.get('federationOrigin' as any) as string;
+  if (!await isServerAllowedInRoom(c.env.DB, roomId, origin)) return Errors.forbidden('Origin server is denied by the room ACL').toResponse();
+  let event: PDU;
+  try { event = await eventVerifier(c.env)(await c.req.json(), room.room_version, roomId); }
+  catch { return Errors.forbidden('Invalid or unsigned leave event').toResponse(); }
+  if (event.event_id !== eventId || event.type !== 'm.room.member' || event.content.membership !== 'leave'
+      || event.sender !== event.state_key || parseUserId(event.sender)?.serverName !== origin) return Errors.forbidden('Invalid leave event').toResponse();
+  if (!await getEvent(c.env.DB, eventId)) {
+    const state = await getRoomState(c.env.DB, roomId);
+    const auth = checkEventAuth(event, state, room.room_version);
+    if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
+    const declared = (await federationAuthChain(c.env.DB, roomId, event.auth_events))
+      .filter(candidate => event.auth_events.includes(candidate.event_id));
+    const declaredAuth = membershipEventAuthorization(event, declared, state.find(candidate => candidate.type === 'm.room.create'), room.room_version);
+    if (!declaredAuth.allowed) return Errors.forbidden(declaredAuth.error).toResponse();
+    await persistLocalRoomEvent(c.env, event, room.room_version);
   }
-
-  // Validate the event is a leave event
-  if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
-      400
-    );
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // v1 returns empty array on success [200, {}]
-  return c.json([200, {}]);
-});
-
-// PUT /_matrix/federation/v2/send_leave/:roomId/:eventId - Complete leave (v2)
-app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event is a leave event
-  if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
-      400
-    );
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // v2 returns empty object on success
-  return c.json({});
+  return c.json(apiVersion === 'v1' ? [200, {}] : {});
 });
 
 // PUT /_matrix/federation/v1/invite/:roomId/:eventId - Receive invite (v1)

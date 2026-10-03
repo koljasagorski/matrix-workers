@@ -1,6 +1,7 @@
 // Database service layer for D1
 
 import type { User, Device, Room, PDU, Membership, Env } from '../types';
+import { getStateBeforeEvent, prepareEventStateSnapshot } from './event-state-snapshots';
 
 // User operations
 export async function createUser(
@@ -257,6 +258,7 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
 
 // Event operations
 export async function storeEvent(db: D1Database, event: PDU, relatedStatements: D1PreparedStatement[] = []): Promise<number> {
+  const snapshot = await prepareEventStateSnapshot(db, event);
   // Allocate the position inside the INSERT: separate reads can give concurrent
   // events the same position and make a later /sync permanently skip one of them.
   const statements = [db.prepare(
@@ -281,6 +283,8 @@ export async function storeEvent(db: D1Database, event: PDU, relatedStatements: 
     event.signatures ? JSON.stringify(event.signatures) : null,
     event.redacts ?? null
   )];
+
+  if (snapshot) statements.push(snapshot);
 
   // A sync position must not become visible before its current state is stored.
   // D1 batches commit all statements together and roll back on any failure.
@@ -731,23 +735,11 @@ export async function getAuthChain(db: D1Database, eventIds: string[]): Promise<
   return chain;
 }
 
-// Get the state at a specific event (by traversing auth chain)
+// Get complete state before an event, using a snapshot or an exact DAG reconstruction.
 export async function getStateAtEvent(db: D1Database, eventId: string): Promise<PDU[]> {
   const event = await getEvent(db, eventId);
   if (!event) return [];
-
-  // Get the auth chain for this event's auth_events
-  const authEvents = await getEventsByIds(db, event.auth_events);
-
-  // Build current state from auth events
-  const stateMap = new Map<string, PDU>();
-  for (const authEvent of authEvents) {
-    if (authEvent.state_key !== undefined) {
-      stateMap.set(`${authEvent.type}\0${authEvent.state_key}`, authEvent);
-    }
-  }
-
-  return Array.from(stateMap.values());
+  return getStateBeforeEvent(db, event.room_id, eventId);
 }
 
 // Get servers that share rooms with a user

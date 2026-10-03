@@ -5,6 +5,7 @@ import slidingSync from '../src/api/sliding-sync';
 import { getRoomEvents } from '../src/services/database';
 import { eventReferenceId, eventVerifier, signEvent, type WireEvent } from '../src/services/federation-events';
 import { persistRemoteJoin } from '../src/services/remote-rooms';
+import { getStateBeforeEvent } from '../src/services/event-state-snapshots';
 import { roomFixture, testEnv } from './federation-helpers';
 
 let ctx: Awaited<ReturnType<typeof testEnv>>;
@@ -91,6 +92,10 @@ it('paginates older encrypted messages across the join boundary without changing
   expect(ctx.sqlite.prepare('SELECT * FROM room_state ORDER BY event_id').all()).toEqual(before);
   expect(ctx.sqlite.prepare('SELECT * FROM events WHERE stream_ordering IS NOT NULL').all()).toHaveLength(1);
   expect((await getRoomEvents(ctx.env.DB,fixture.roomId)).events).toHaveLength(1);
+  const snapshot = await getStateBeforeEvent(ctx.env.DB, fixture.roomId, oldMessages[3]);
+  expect(snapshot.find(event => event.type === 'm.room.history_visibility')?.content.history_visibility).toBe('shared');
+  expect(snapshot.some(event => event.state_key === '@alice:local.example')).toBe(false);
+  expect(ctx.sqlite.prepare('SELECT event_id FROM events WHERE event_id=?').get(oldMessages[3])).toBeUndefined();
   const event = await rooms.request(`${base}/event/${encodeURIComponent(oldMessages[3])}`,{headers},ctx.env);
   expect(event.status).toBe(200);
   expect((await event.json()).content.ciphertext).toBe('old-ciphertext-3');
@@ -108,6 +113,7 @@ it('does not expose pre-join messages whose historical visibility was joined', a
   expect(response.status).toBe(200);
   expect(await response.json()).toMatchObject({chunk:[],end:expect.stringMatching(/^rh_/)});
   expect((await rooms.request(`${base}/event/${encodeURIComponent(oldMessages[3])}`,{headers},ctx.env)).status).toBe(404);
+  expect((await getStateBeforeEvent(ctx.env.DB, fixture.roomId, oldMessages[3])).find(event => event.type === 'm.room.history_visibility')?.content.history_visibility).toBe('joined');
 });
 
 it('binds historical cursors to the room and user and checks membership before cache access', async () => {

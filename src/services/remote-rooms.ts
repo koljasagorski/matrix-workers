@@ -1,4 +1,5 @@
 import type { Env, PDU } from '../types';
+import { prepareVerifiedStateSnapshot } from './event-state-snapshots';
 import { Errors, MatrixApiError } from '../utils/errors';
 import { parseRoomAlias, parseRoomId, parseUserId } from '../utils/ids';
 import { canonicalJson } from '../utils/crypto';
@@ -164,6 +165,7 @@ export async function persistRemoteJoin(env: Env, version: string, events: PDU[]
     }
   }
   // D1 batch is transactional: a failed import must never expose a partial room to sync.
+  statements.push(...await prepareVerifiedStateSnapshot(db, join, state, events, version));
   await db.batch(statements);
   await invalidateRoomCache(env.CACHE, join.room_id);
 }

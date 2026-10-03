@@ -7,6 +7,7 @@ import { eventVerifier, FEDERATED_ROOM_VERSIONS, isObject } from './federation-e
 import { readFederationJson } from './federation-http';
 import { getServerSigningKey, makeFederationRequest } from './federation-keys';
 import { locateRoom, validateJoinGraph } from './remote-rooms';
+import { prepareVerifiedStateSnapshot } from './event-state-snapshots';
 
 // History is fetched on demand, separately from the live stream. In particular,
 // old memberships must never replace current memberships or trigger notifications.
@@ -114,6 +115,7 @@ export async function getRemoteHistory(
           const auth = await verifyAll(snapshot.auth_chain);
           const state = await verifyAll(snapshot.pdus);
           validateJoinGraph([...auth, ...state, event], state, event, room.room_version);
+          await env.DB.batch(await prepareVerifiedStateSnapshot(env.DB, event, state, auth, room.room_version));
           const history = state.find(e => e.type === 'm.room.history_visibility' && e.state_key === '');
           const visibility = history?.content.history_visibility ?? 'shared';
           const member = state.find(e => e.type === 'm.room.member' && e.state_key === userId);
