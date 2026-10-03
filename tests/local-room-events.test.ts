@@ -209,6 +209,24 @@ describe('authorized signed local room events', () => {
     expect(queued).toEqual([]);
   });
 
+  it('creates signed v12 replacement state and a federated tombstone during an upgrade', async () => {
+    const old = await create('10', { name: 'Before upgrade', initial_state: [{ type: 'm.room.encryption', content: { algorithm: 'm.megolm.v1.aes-sha2' } }] });
+    await addRemoteResident(old, '10'); queued = [];
+    const response = await request(roomPath(old, 'upgrade'), 'POST', { new_version: '12' });
+    expect(response.status).toBe(200);
+    const { replacement_room: replacement } = await response.json() as { replacement_room: string };
+    const state = await getRoomState(ctx.env.DB, replacement);
+    for (const event of state) assertSigned(event, '12');
+    const creation = state.find(event => event.type === 'm.room.create')!;
+    expect(replacement).toBe(`!${creation.event_id.slice(1)}`);
+    expect(state.find(event => event.type === 'm.room.name')?.content).toEqual({ name: 'Before upgrade' });
+    expect(state.find(event => event.type === 'm.room.encryption')?.content.algorithm).toBe('m.megolm.v1.aes-sha2');
+    const tombstone = (await getRoomState(ctx.env.DB, old)).find(event => event.type === 'm.room.tombstone')!;
+    assertSigned(tombstone, '10'); expect(tombstone.content.replacement_room).toBe(replacement);
+    expect(queued.some(item => item.pdu.type === 'm.room.tombstone' && item.destination === 'remote.example')).toBe(true);
+    expect(await (await request(roomPath(old, 'upgrade'), 'POST', { new_version: '12' })).json()).toEqual({ replacement_room: replacement });
+  });
+
   it('accepts a sync token with receipt progress for backwards room pagination', async () => {
     const roomId = await create();
     const response = await request(`${roomPath(roomId, 'messages')}?from=s100_td0_dk0_rr1&dir=b&limit=1`, 'GET');

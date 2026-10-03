@@ -9,6 +9,7 @@ import { fetchRemoteServerKeys, getServerSigningKey, makeFederationRequest } fro
 import { queueRoomEvent } from './federation-delivery';
 import { readFederationJson } from './federation-http';
 import { invalidateRoomCache } from './room-cache';
+import { prepareRestrictedJoinContent } from './restricted-joins';
 
 interface LocalEventInput {
   roomId: string;
@@ -47,6 +48,9 @@ export async function buildLocalRoomEvent(env: Env, input: LocalEventInput, init
   const version = initialVersion ?? room!.room_version;
   if (!FEDERATED_ROOM_VERSIONS.includes(version)) throw Errors.unsupportedRoomVersion();
   const state = initialVersion ? [] : await getRoomState(env.DB, input.roomId);
+  if (input.type === 'm.room.member' && input.content.membership === 'join') {
+    input = { ...input, content: await prepareRestrictedJoinContent(env, input.roomId, input.sender, input.content, state, version) };
+  }
   if (input.type === 'm.room.create' && state.length) throw Errors.forbidden('Room creation state cannot be replaced');
   const latest = input.type === 'm.room.create' ? null : await env.DB.prepare(
     'SELECT event_id,depth FROM events WHERE room_id=? ORDER BY depth DESC,stream_ordering DESC LIMIT 1'

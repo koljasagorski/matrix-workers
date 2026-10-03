@@ -6,10 +6,18 @@
 import { resolveRoomAlias } from '../services/remote-rooms';
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { requireAliasDeleteAccess, requireLocalRoomAlias, requireRoomDirectoryAccess } from '../services/room-alias-access';
+import { createRoomAlias } from '../services/database';
+import { isObject } from '../services/federation-events';
 
 const app = new Hono<AppEnv>();
+app.onError((error, c) => {
+  if (error instanceof MatrixApiError) return error.toResponse();
+  console.error('[aliases] Request failed:', error);
+  return c.json({ errcode: 'M_UNKNOWN', error: 'Room alias request failed' }, 500);
+});
 
 // ============================================
 // Endpoints
@@ -23,7 +31,8 @@ app.get('/_matrix/client/v3/directory/room/:roomAlias', async (c) => {
 // PUT /_matrix/client/v3/directory/room/:roomAlias - Create room alias
 app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c) => {
   const userId = c.get('userId');
-  const roomAlias = decodeURIComponent(c.req.param('roomAlias'));
+  const roomAlias = c.req.param('roomAlias');
+  requireLocalRoomAlias(c.env, roomAlias);
   const db = c.env.DB;
 
   let body: { room_id: string };
@@ -32,25 +41,17 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
   } catch {
     return Errors.badJson().toResponse();
   }
-
+  if (!isObject(body)) return Errors.badJson().toResponse();
   if (!body.room_id) {
     return Errors.missingParam('room_id').toResponse();
   }
+  if (typeof body.room_id !== 'string') return Errors.invalidParam('room_id').toResponse();
 
   // Validate alias format
   if (!roomAlias.startsWith('#') || !roomAlias.includes(':')) {
     return c.json({
       errcode: 'M_INVALID_PARAM',
       error: 'Invalid room alias format',
-    }, 400);
-  }
-
-  // Check alias is for our server
-  const [, aliasServer] = roomAlias.split(':');
-  if (aliasServer !== c.env.SERVER_NAME) {
-    return c.json({
-      errcode: 'M_INVALID_PARAM',
-      error: 'Cannot create alias for another server',
     }, 400);
   }
 
@@ -85,10 +86,7 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
   }
 
   // Create alias
-  await db.prepare(`
-    INSERT INTO room_aliases (alias, room_id, creator_id, servers, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).bind(roomAlias, body.room_id, userId, JSON.stringify([c.env.SERVER_NAME]), Date.now()).run();
+  await createRoomAlias(db, roomAlias, body.room_id, userId);
 
   return c.json({});
 });
@@ -96,45 +94,9 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
 // DELETE /_matrix/client/v3/directory/room/:roomAlias - Delete room alias
 app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c) => {
   const userId = c.get('userId');
-  const roomAlias = decodeURIComponent(c.req.param('roomAlias'));
+  const roomAlias = c.req.param('roomAlias');
   const db = c.env.DB;
-
-  // Find alias
-  const alias = await db.prepare(`
-    SELECT room_id, creator_id FROM room_aliases WHERE alias = ?
-  `).bind(roomAlias).first<{ room_id: string; creator_id: string }>();
-
-  if (!alias) {
-    return Errors.notFound('Room alias not found').toResponse();
-  }
-
-  // Check permissions - creator or room admin can delete
-  const canDelete = alias.creator_id === userId;
-
-  if (!canDelete) {
-    // Check if user has power to delete aliases in the room
-    const powerLevels = await db.prepare(`
-      SELECT e.content FROM room_state rs
-      JOIN events e ON rs.event_id = e.event_id
-      WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'
-    `).bind(alias.room_id).first<{ content: string }>();
-
-    if (powerLevels) {
-      try {
-        const levels = JSON.parse(powerLevels.content);
-        const userPower = levels.users?.[userId] || levels.users_default || 0;
-        const aliasLevel = levels.state_default || 50;
-
-        if (userPower < aliasLevel) {
-          return Errors.forbidden('Insufficient power level to delete alias').toResponse();
-        }
-      } catch {
-        return Errors.forbidden('Cannot delete alias').toResponse();
-      }
-    } else {
-      return Errors.forbidden('Cannot delete alias').toResponse();
-    }
-  }
+  await requireAliasDeleteAccess(c.env, roomAlias, userId);
 
   // Delete alias
   await db.prepare(`
@@ -174,40 +136,13 @@ app.put('/_matrix/client/v3/directory/list/room/:roomId', requireAuth(), async (
   } catch {
     return Errors.badJson().toResponse();
   }
+  if (!isObject(body)) return Errors.badJson().toResponse();
 
   if (!body.visibility || !['public', 'private'].includes(body.visibility)) {
     return Errors.missingParam('visibility').toResponse();
   }
 
-  // Check user has power to change visibility
-  const membership = await db.prepare(`
-    SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
-  `).bind(roomId, userId).first<{ membership: string }>();
-
-  if (!membership || membership.membership !== 'join') {
-    return Errors.forbidden('Not a member of this room').toResponse();
-  }
-
-  // Check power level
-  const powerLevels = await db.prepare(`
-    SELECT e.content FROM room_state rs
-    JOIN events e ON rs.event_id = e.event_id
-    WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'
-  `).bind(roomId).first<{ content: string }>();
-
-  if (powerLevels) {
-    try {
-      const levels = JSON.parse(powerLevels.content);
-      const userPower = levels.users?.[userId] || levels.users_default || 0;
-      const requiredPower = levels.state_default || 50;
-
-      if (userPower < requiredPower) {
-        return Errors.forbidden('Insufficient power level').toResponse();
-      }
-    } catch {
-      return Errors.forbidden('Cannot change visibility').toResponse();
-    }
-  }
+  await requireRoomDirectoryAccess(c.env, roomId, userId);
 
   // Update visibility
   await db.prepare(`

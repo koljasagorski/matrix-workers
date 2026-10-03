@@ -57,6 +57,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
+  if (!eventId.startsWith('$') || !await db.prepare('SELECT 1 FROM events WHERE event_id=? AND room_id=?')
+    .bind(eventId, roomId).first()) {
+    return Errors.notFound('Event not found in this room').toResponse();
+  }
+
   // Parse optional body for thread_id
   let threadId: string | undefined;
   const text = await c.req.text();
@@ -132,6 +137,17 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 
   if (!membership || membership.membership !== 'join') {
     return Errors.forbidden('Not a member of this room').toResponse();
+  }
+
+  // Validate every target before making any changes to this combined request.
+  const targets = ['m.read', 'm.read.private', 'm.fully_read'].flatMap(key => {
+    const value = body[key as keyof typeof body];
+    return value === undefined ? [] : [value];
+  });
+  for (const eventId of new Set(targets)) {
+    if (!await db.prepare('SELECT 1 FROM events WHERE event_id=? AND room_id=?').bind(eventId, roomId).first()) {
+      return Errors.notFound('Event not found in this room').toResponse();
+    }
   }
 
   // Process m.fully_read (stored in account data for unread counts)

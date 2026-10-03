@@ -531,6 +531,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         ephemeral.events = ephemeral.events.filter(event => event.type !== 'm.receipt');
         const receipts = await getReceiptsForRoom(c.env, roomId, userId);
         if (Object.keys(receipts.content).length) ephemeral.events.push(receipts);
+        ephemeral.events = applyEventFilter(ephemeral.events, filter?.room?.ephemeral);
       }
       const changed = await changedDeviceUsers(c.env.DB, userId, sinceKeys, currentKeys);
       if (changed.length) response.device_lists = {changed, left:[]};

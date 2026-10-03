@@ -980,7 +980,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
       `).bind(roomId, userId).first<{ membership: string }>();
 
-      if (!membershipResult) {
+      if (!membershipResult || !['join', 'invite'].includes(membershipResult.membership)) {
         continue; // Skip rooms user isn't in
       }
 
@@ -1209,7 +1209,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       const allRoomIds = [...new Set([...responseRoomIds, ...subscribedRoomIds])];
 
       if (allRoomIds.length > 0) {
-        const typingByRoom = await getTypingForRooms(c.env, allRoomIds);
+        const typingByRoom = await getTypingForRooms(c.env, allRoomIds, userId);
 
         // Always include typing for all rooms so clients know when typing stops
         response.extensions.typing = { rooms: {} };
@@ -1709,7 +1709,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       const allRoomIds = [...new Set([...responseRoomIds, ...subscribedRoomIds])];
 
       if (allRoomIds.length > 0) {
-        const typingByRoom = await getTypingForRooms(c.env, allRoomIds);
+        const typingByRoom = await getTypingForRooms(c.env, allRoomIds, userId);
 
         // Always include typing extension with all rooms so clients know when typing stops
         response.extensions.typing = { rooms: {} };
@@ -1793,7 +1793,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     const userRoomIds = (userRoomsResult.results as { room_id: string }[]).map(r => r.room_id);
 
     // Fallback: Include typing for all rooms - uses Room Durable Objects
-    const typingByRoom = await getTypingForRooms(c.env, userRoomIds);
+    const typingByRoom = await getTypingForRooms(c.env, userRoomIds, userId);
 
     // Always include typing for all rooms so clients know when typing stops
     response.extensions.typing = { rooms: {} };

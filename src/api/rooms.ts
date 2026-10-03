@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, Env, PDU } from '../types';
 import { Errors, MatrixApiError } from '../utils/errors';
-import { requireAuth } from '../middleware/auth';
+import { optionalAuth, requireAuth } from '../middleware/auth';
 import { generateRoomId, formatRoomAlias, parseUserId } from '../utils/ids';
 import { getDefaultRoomVersion } from '../services/room-versions';
 import {
@@ -28,6 +28,7 @@ import { getTransaction, storeTransaction } from '../services/transactions';
 import { buildLocalRoomEvent, persistLocalRoomEvent, rejectRemoteInvite, sendLocalRoomEvent } from '../services/local-room-events';
 import { resolveRoomAlias, locateRoom, joinRemoteRoom, remoteRoomSummary } from '../services/remote-rooms';
 import { getRemoteHistory, getHistoricalEvent } from '../services/room-history';
+import { requireAliasDeleteAccess, requireLocalRoomAlias } from '../services/room-alias-access';
 
 const app = new Hono<AppEnv>({ strict: false });
 app.onError((error, c) => {
@@ -113,8 +114,9 @@ async function createInitialRoomEvents(
   }, creatorId);
   const preset = options.preset || 'private_chat';
   const users: Record<string, number> = roomVersion === '12' ? {} : { [creatorId]: 100 };
+  const creators = roomVersion === '12' ? [creatorId, ...(Array.isArray(createEvent.content.additional_creators) ? createEvent.content.additional_creators : [])] : [];
   if (preset === 'trusted_private_chat') for (const invitee of options.invite ?? []) {
-    if (invitee !== creatorId) users[invitee] = 100;
+    if (invitee !== creatorId && !creators.includes(invitee)) users[invitee] = 100;
   }
   await createEventInRoom('m.room.power_levels', {
     ban: 50, events: {
@@ -321,7 +323,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
 
   // Determine if user can join
   let canJoin = false;
-  if (joinRule === 'public') {
+  if (['public', 'restricted', 'knock_restricted'].includes(joinRule)) {
     canJoin = true;
   } else if (currentMembership?.membership === 'invite') {
     canJoin = true;
@@ -982,7 +984,7 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
 
   // Determine if user can join
   let canJoin = false;
-  if (joinRule === 'public') {
+  if (['public', 'restricted', 'knock_restricted'].includes(joinRule)) {
     canJoin = true;
   } else if (currentMembership?.membership === 'invite') {
     canJoin = true;
@@ -1010,7 +1012,8 @@ app.get('/_matrix/client/v3/directory/room/:roomAlias', async (c) => {
 // PUT /_matrix/client/v3/directory/room/:roomAlias
 app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c) => {
   const userId = c.get('userId');
-  const alias = decodeURIComponent(c.req.param('roomAlias'));
+  const alias = c.req.param('roomAlias');
+  requireLocalRoomAlias(c.env, alias);
 
   let body: any;
   try {
@@ -1019,10 +1022,12 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
     return Errors.badJson().toResponse();
   }
 
+  if (!isObject(body)) return Errors.badJson().toResponse();
   const { room_id } = body;
   if (!room_id) {
     return Errors.missingParam('room_id').toResponse();
   }
+  if (typeof room_id !== 'string') return Errors.invalidParam('room_id').toResponse();
 
   // Check if alias already exists
   const existing = await getRoomByAlias(c.env.DB, alias);
@@ -1042,15 +1047,8 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
 
 // DELETE /_matrix/client/v3/directory/room/:roomAlias
 app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c) => {
-  // Note: userId could be used for permission checks in future
-  void c.get('userId');
-  const alias = decodeURIComponent(c.req.param('roomAlias'));
-
-  const roomId = await getRoomByAlias(c.env.DB, alias);
-  if (!roomId) {
-    return Errors.notFound('Room alias not found').toResponse();
-  }
-
+  const alias = c.req.param('roomAlias');
+  await requireAliasDeleteAccess(c.env, alias, c.get('userId'));
   await deleteRoomAlias(c.env.DB, alias);
   return c.json({});
 });
@@ -1061,7 +1059,7 @@ app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async 
 
 // GET /_matrix/client/v1/room_summary/:roomIdOrAlias - Get a summary of a room
 // Allows previewing a room without joining it (if permitted by room settings)
-for (const path of ['/_matrix/client/v1/room_summary/:roomIdOrAlias', '/_matrix/client/unstable/im.nheko.summary/summary/:roomIdOrAlias']) app.get(path, async (c) => {
+for (const path of ['/_matrix/client/v1/room_summary/:roomIdOrAlias', '/_matrix/client/unstable/im.nheko.summary/summary/:roomIdOrAlias']) app.get(path, optionalAuth(), async (c) => {
   const roomIdOrAlias = c.req.param('roomIdOrAlias')!;
   const db = c.env.DB;
 
@@ -1140,26 +1138,12 @@ for (const path of ['/_matrix/client/v1/room_summary/:roomIdOrAlias', '/_matrix/
   response.guest_can_join = guestCanJoin;
 
   // Check user membership if authenticated (optional auth)
-  const authHeader = c.req.header('Authorization');
-  if (authHeader?.startsWith('Bearer ')) {
-    const token = authHeader.slice(7);
-    const { hashToken } = await import('../utils/crypto');
-    const tokenHash = await hashToken(token);
-    const tokenResult = await db.prepare(
-      `SELECT user_id FROM access_tokens WHERE token_hash = ?`
-    ).bind(tokenHash).first<{ user_id: string }>();
-
-    if (tokenResult) {
-      const membership = await db.prepare(
-        `SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`
-      ).bind(roomId, tokenResult.user_id).first<{ membership: string }>();
-      response.membership = membership?.membership || 'leave';
-    }
-  }
+  const userId = c.get('userId');
+  if (userId) response.membership = (await getMembership(db, roomId, userId))?.membership ?? 'leave';
 
   // Check if room summary is allowed based on join rules
   // For non-public rooms, only show summary if user is a member or if world_readable
-  if (!room.is_public && !worldReadable && !response.membership) {
+  if (!room.is_public && !worldReadable && !['join', 'invite'].includes(String(response.membership))) {
     // Don't reveal room existence for private rooms to non-members
     if (!['public', 'knock', 'knock_restricted'].includes(joinRule)) {
       return Errors.notFound('Room not found').toResponse();

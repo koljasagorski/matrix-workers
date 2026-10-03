@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import slidingSync from '../src/api/sliding-sync';
 import { testEnv } from './federation-helpers';
 import { hashToken } from '../src/utils/crypto';
@@ -65,4 +65,42 @@ it('marks an incomplete initial timeline as limited so clients can request remot
   expect(initial.rooms[room].prev_batch).toBe('s1');
   const next = await sync(both, initial.pos);
   expect(next.rooms[room]?.timeline ?? []).toEqual([]);
+});
+
+it.each([
+  '/_matrix/client/unstable/org.matrix.msc3575/sync',
+  '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync',
+  '/_matrix/client/v4/sync',
+])('protects timelines, receipts, and typing for unauthorized subscriptions at %s', async path => {
+  const memberships = ['leave', 'ban', 'knock', 'invite', undefined];
+  const hiddenRooms = memberships.map((_, index) => `!hidden${index}:local.example`);
+  for (let i = 0; i < hiddenRooms.length; i++) {
+    const id = hiddenRooms[i];
+    ctx.sqlite.prepare("INSERT INTO rooms(room_id,room_version,creator_id) VALUES (?,'12',?)").run(id, user);
+    if (memberships[i]) ctx.sqlite.prepare('INSERT INTO room_memberships(room_id,user_id,membership,event_id) VALUES (?,?,?,?)')
+      .run(id, user, memberships[i], '$membership');
+    ctx.sqlite.prepare(`INSERT INTO events(event_id,room_id,sender,event_type,content,origin_server_ts,depth,auth_events,prev_events,stream_ordering)
+      VALUES (?, ?, ?, 'm.room.encrypted', '{"ciphertext":"private"}', 1, 1, '[]', '[]', ?)`)
+      .run(`$hidden${i}`, id, user, 10 + i);
+  }
+  const roomFetch = vi.fn(async (request: Request) => {
+    return new URL(request.url).pathname === '/typing'
+      ? Response.json({ user_ids: ['@secret:elsewhere.example'] })
+      : Response.json({ receipts: { '$secret': { 'm.read': { '@secret:elsewhere.example': { ts: 100 } } } } });
+  });
+  ctx.env.ROOMS = { idFromName: (s: string) => s, get: () => ({ fetch: roomFetch }) } as any;
+  const response = await slidingSync.request(path + '?timeout=0', {
+    method: 'POST', headers: { Authorization: 'Bearer token' }, body: JSON.stringify({
+      conn_id: 'privacy', room_subscriptions: Object.fromEntries(hiddenRooms.map(id => [id, config])),
+      extensions: { typing: { enabled: true }, receipts: { enabled: true } },
+    }),
+  }, ctx.env);
+  expect(response.status).toBe(200);
+  const data = await response.json() as any;
+  for (const id of hiddenRooms) {
+    expect(data.rooms[id]?.timeline ?? []).toEqual([]);
+    expect(data.extensions.receipts?.rooms[id]).toBeUndefined();
+    expect(data.extensions.typing?.rooms[id]?.content.user_ids ?? []).toEqual([]);
+  }
+  expect(roomFetch).not.toHaveBeenCalled();
 });

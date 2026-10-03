@@ -114,7 +114,8 @@ export async function getTypingUsers(
 // Get typing status for multiple rooms (for sync) - uses Room Durable Objects
 export async function getTypingForRooms(
   env: Env,
-  roomIds: string[]
+  roomIds: string[],
+  requestingUserId: string
 ): Promise<Record<string, string[]>> {
   if (roomIds.length === 0) return {};
 
@@ -124,6 +125,9 @@ export async function getTypingForRooms(
   const results = await Promise.all(
     roomIds.map(async (roomId) => {
       try {
+        const member = await env.DB.prepare('SELECT membership FROM room_memberships WHERE room_id=? AND user_id=?')
+          .bind(roomId, requestingUserId).first<{ membership: string }>();
+        if (member?.membership !== 'join') return { roomId, users: [] };
         const users = await getTypingUsers(env, roomId);
         return { roomId, users };
       } catch {

@@ -148,6 +148,35 @@ it('returns receipts arriving during a classic sync wait in the same response', 
   expect(data.next_batch).toBe('s1_td0_dk0_rr1');
 });
 
+it('honors the classic ephemeral filter after a receipt wakes long polling', async () => {
+  onWait = async () => { await receiveReadReceipts(ctx.env, 'remote.example', content()); };
+  const filter = encodeURIComponent(JSON.stringify({ room: { ephemeral: { not_types: ['m.receipt'] } } }));
+  const response = await sync.request(`/_matrix/client/v3/sync?since=s1_td0_dk0&timeout=25000&filter=${filter}`, { headers }, ctx.env);
+  const data = await response.json();
+  expect(waitCalls).toBe(1);
+  expect(data.rooms.join[room].ephemeral.events).toEqual([]);
+  expect(data.next_batch).toBe('s1_td0_dk0_rr1');
+});
+
+it('rejects foreign and missing read-marker targets before any receipt or account-data write', async () => {
+  ctx.sqlite.prepare("INSERT INTO rooms(room_id,room_version,creator_id) VALUES ('!other:local.example','10',?)").run(user);
+  ctx.sqlite.prepare(`INSERT INTO events(event_id,room_id,sender,event_type,content,origin_server_ts,depth,auth_events,prev_events)
+    VALUES ('$foreign','!other:local.example',?,'m.room.message','{}',1,1,'[]','[]')`).run(user);
+  for (const id of ['$foreign', '$missing']) {
+    const direct = await receipts.request(`/_matrix/client/v3/rooms/${encodeURIComponent(room)}/receipt/m.fully_read/${id}`, {
+      method: 'POST', headers, body: '{}',
+    }, ctx.env);
+    expect(direct.status).toBe(404);
+    const combined = await receipts.request(`/_matrix/client/v3/rooms/${encodeURIComponent(room)}/read_markers`, {
+      method: 'POST', headers, body: JSON.stringify({ 'm.fully_read': '$message', 'm.read': '$message', 'm.read.private': id }),
+    }, ctx.env);
+    expect(combined.status).toBe(404);
+  }
+  expect(ctx.sqlite.prepare('SELECT COUNT(*) AS n FROM account_data').get()).toEqual({ n: 0 });
+  expect(queued).toEqual([]);
+  expect(await receiptPosition(ctx.env.DB)).toBe(0);
+});
+
 it('returns receipts arriving during sliding sync in the same response and advances its independent receipt cursor', async () => {
   const first = await (await sliding()).json();
   onWait = async () => { await receiveReadReceipts(ctx.env, 'remote.example', content()); };
