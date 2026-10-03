@@ -4,9 +4,16 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { getMatrixTurnCredentials, getStunServers, isTurnConfigured, TurnError } from '../services/turn';
-import { notifyUsersOfEvent } from '../services/database';
+import { sendLocalRoomEvent } from '../services/local-room-events';
+import { isObject } from '../services/federation-events';
+import { Errors, MatrixApiError } from '../utils/errors';
 
 const app = new Hono<AppEnv>();
+app.onError((error) => {
+  if (error instanceof MatrixApiError) return error.toResponse();
+  console.error('[voip] Request failed:', error);
+  return Errors.unknown().toResponse();
+});
 
 // GET /_matrix/client/v3/voip/turnServer - Get TURN server credentials
 // Spec: https://spec.matrix.org/v1.12/client-server-api/#get_matrixclientv3voipturnserver
@@ -93,8 +100,9 @@ app.get('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
 
   // Get all m.call.member state events for the room
   const memberEvents = await db.prepare(`
-    SELECT state_key, content FROM room_state
-    WHERE room_id = ? AND type = 'm.call.member'
+    SELECT rs.state_key, e.content FROM room_state rs
+    JOIN events e ON e.event_id = rs.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.call.member'
   `).bind(roomId).all<{ state_key: string; content: string }>();
 
   // Find active memberships (not expired)
@@ -112,9 +120,10 @@ app.get('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
   for (const event of memberEvents.results) {
     try {
       const content = JSON.parse(event.content);
-      const memberships = content.memberships || [];
+      const memberships: typeof activeMembers = Array.isArray(content.memberships) ? content.memberships : [];
 
       for (const membership of memberships) {
+        if (!isObject(membership) || typeof membership.device_id !== 'string') continue;
         // Check if membership is still valid (not expired)
         if (!membership.expires_ts || membership.expires_ts > now) {
           activeMembers.push({
@@ -184,6 +193,13 @@ app.put('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
     }, 400);
   }
 
+  if (!isObject(body) || (body.device_id !== undefined && typeof body.device_id !== 'string') ||
+      (body.application !== undefined && typeof body.application !== 'string') ||
+      (body.call_id !== undefined && typeof body.call_id !== 'string') ||
+      (body.expires_ts !== undefined && !Number.isSafeInteger(body.expires_ts))) {
+    return Errors.badJson('Invalid call membership content').toResponse();
+  }
+
   const targetDeviceId = body.device_id || deviceId;
   if (!targetDeviceId) {
     return c.json({
@@ -194,8 +210,9 @@ app.put('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
 
   // Get current m.call.member state for this user
   const existing = await db.prepare(`
-    SELECT content FROM room_state
-    WHERE room_id = ? AND type = 'm.call.member' AND state_key = ?
+    SELECT e.content FROM room_state rs
+    JOIN events e ON e.event_id = rs.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.call.member' AND rs.state_key = ?
   `).bind(roomId, userId).first<{ content: string }>();
 
   let memberships: Array<{
@@ -210,7 +227,7 @@ app.put('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
   if (existing) {
     try {
       const content = JSON.parse(existing.content);
-      memberships = content.memberships || [];
+      memberships = Array.isArray(content.memberships) ? content.memberships : [];
     } catch (e) {
       console.error('[voip] Failed to parse existing m.call.member:', e);
     }
@@ -235,34 +252,12 @@ app.put('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => {
   }
 
   // Store the updated m.call.member state event
-  const eventId = `$${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-  const content = { memberships };
-  const now = Date.now();
-
-  // Insert or update room_state
-  await db.prepare(`
-    INSERT INTO room_state (room_id, type, state_key, event_id, content, sender, origin_server_ts)
-    VALUES (?, 'm.call.member', ?, ?, ?, ?, ?)
-    ON CONFLICT (room_id, type, state_key) DO UPDATE SET
-      event_id = excluded.event_id,
-      content = excluded.content,
-      sender = excluded.sender,
-      origin_server_ts = excluded.origin_server_ts
-  `).bind(roomId, userId, eventId, JSON.stringify(content), userId, now).run();
-
-  // Insert into events table for sync
-  await db.prepare(`
-    INSERT INTO events (event_id, room_id, type, sender, content, state_key, origin_server_ts)
-    VALUES (?, ?, 'm.call.member', ?, ?, ?, ?)
-  `).bind(eventId, roomId, userId, JSON.stringify(content), userId, now).run();
-
-  console.log('[voip] User', userId, 'device', targetDeviceId, 'joined call in room', roomId);
-
-  // Notify room members about the call state change (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.call.member');
+  const event = await sendLocalRoomEvent(c.env, {
+    roomId, sender: userId, type: 'm.call.member', stateKey: userId, content: { memberships },
+  });
 
   return c.json({
-    event_id: eventId,
+    event_id: event.event_id,
   });
 });
 
@@ -273,6 +268,11 @@ app.delete('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => 
   const userId = c.get('userId');
   const deviceId = c.get('deviceId');
   const db = c.env.DB;
+
+  const roomMembership = await db.prepare(`
+    SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
+  `).bind(roomId, userId).first<{ membership: string }>();
+  if (roomMembership?.membership !== 'join') return Errors.forbidden('You are not a member of this room').toResponse();
 
   // Get device_id from query param or use current device
   const targetDeviceId = c.req.query('device_id') || deviceId;
@@ -286,8 +286,9 @@ app.delete('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => 
 
   // Get current m.call.member state for this user
   const existing = await db.prepare(`
-    SELECT content FROM room_state
-    WHERE room_id = ? AND type = 'm.call.member' AND state_key = ?
+    SELECT e.content FROM room_state rs
+    JOIN events e ON e.event_id = rs.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.call.member' AND rs.state_key = ?
   `).bind(roomId, userId).first<{ content: string }>();
 
   if (!existing) {
@@ -306,7 +307,7 @@ app.delete('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => 
 
   try {
     const content = JSON.parse(existing.content);
-    memberships = content.memberships || [];
+    memberships = Array.isArray(content.memberships) ? content.memberships : [];
   } catch (e) {
     console.error('[voip] Failed to parse existing m.call.member:', e);
     return c.json({});
@@ -316,27 +317,12 @@ app.delete('/_matrix/client/v1/rooms/:roomId/call', requireAuth(), async (c) => 
   const newMemberships = memberships.filter(m => m.device_id !== targetDeviceId);
 
   // Store the updated m.call.member state event (with empty or reduced memberships)
-  const eventId = `$${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-  const content = { memberships: newMemberships };
-  const now = Date.now();
-
-  // Update room_state
-  await db.prepare(`
-    UPDATE room_state
-    SET event_id = ?, content = ?, sender = ?, origin_server_ts = ?
-    WHERE room_id = ? AND type = 'm.call.member' AND state_key = ?
-  `).bind(eventId, JSON.stringify(content), userId, now, roomId, userId).run();
-
-  // Insert into events table for sync
-  await db.prepare(`
-    INSERT INTO events (event_id, room_id, type, sender, content, state_key, origin_server_ts)
-    VALUES (?, ?, 'm.call.member', ?, ?, ?, ?)
-  `).bind(eventId, roomId, userId, JSON.stringify(content), userId, now).run();
-
-  console.log('[voip] User', userId, 'device', targetDeviceId, 'left call in room', roomId);
+  const event = await sendLocalRoomEvent(c.env, {
+    roomId, sender: userId, type: 'm.call.member', stateKey: userId, content: { memberships: newMemberships },
+  });
 
   return c.json({
-    event_id: eventId,
+    event_id: event.event_id,
   });
 });
 

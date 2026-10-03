@@ -5,7 +5,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { hashToken } from '../utils/crypto';
 import { getUserByTokenHash } from '../services/database';
-import { getAppServiceByToken } from '../services/appservice';
+import { canAppServiceActAsUser, getAppServiceByToken } from '../services/appservice';
 
 export type AuthContext = {
   userId: string;
@@ -73,6 +73,9 @@ export function requireAuth() {
           const asUserId = url.searchParams.get('user_id');
           const serverName = c.env.SERVER_NAME;
           const senderUserId = asUserId || `@${appservice.sender_localpart}:${serverName}`;
+          if (!canAppServiceActAsUser(appservice, senderUserId, serverName)) {
+            return Errors.forbidden('Application service cannot act as this user').toResponse();
+          }
           auth = {
             userId: senderUserId,
             deviceId: null,
@@ -87,9 +90,6 @@ export function requireAuth() {
     if (!auth) {
       return Errors.unknownToken().toResponse();
     }
-
-
-
     // Store auth context
     c.set('auth', auth);
     c.set('userId', auth.userId);

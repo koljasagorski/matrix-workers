@@ -138,6 +138,10 @@ function checkCreateEvent(event: PDU, _state: RoomStateMap): AuthResult {
   if (!content.room_version && !content.creator) {
     return { allowed: false, error: 'm.room.create must have creator or room_version' };
   }
+  if (content.room_version === '12' && content.additional_creators !== undefined &&
+      (!Array.isArray(content.additional_creators) || content.additional_creators.some(id => typeof id !== 'string' || !parseUserId(id)))) {
+    return { allowed: false, error: 'Invalid additional room creators' };
+  }
 
   return { allowed: true };
 }

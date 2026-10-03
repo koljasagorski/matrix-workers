@@ -45,6 +45,7 @@ import { adminDashboardHtml } from './admin/dashboard';
 import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth } from './middleware/auth';
 import { analyticsMiddleware } from './middleware/analytics';
+import { getSupportedRoomVersions } from './services/room-versions';
 
 // Import Durable Objects
 export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
@@ -168,20 +169,7 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
       },
       'm.room_versions': {
         default: '10',
-        available: {
-          '1': 'stable',
-          '2': 'stable',
-          '3': 'stable',
-          '4': 'stable',
-          '5': 'stable',
-          '6': 'stable',
-          '7': 'stable',
-          '8': 'stable',
-          '9': 'stable',
-          '10': 'stable',
-          '11': 'stable',
-          '12': 'stable',
-        },
+        available: getSupportedRoomVersions(),
       },
       'm.set_displayname': {
         enabled: true,

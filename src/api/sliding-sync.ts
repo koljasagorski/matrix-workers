@@ -11,6 +11,7 @@ import { getToDeviceMessages } from './to-device';
 import { parseSyncPosition, deviceKeyPosition, changedDeviceUsers } from '../services/sync-positions';
 import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
+import { receiptPosition } from '../services/read-receipts';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
@@ -1383,7 +1384,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
 
   // Get current stream position from database
   const currentStreamPos = await getCurrentStreamPosition(db);
-  const currentKeys = await deviceKeyPosition(db);
+  let currentKeys = await deviceKeyPosition(db);
+  let currentReceipts = await receiptPosition(db);
 
   // Get or create connection state
   let connectionState: ConnectionState | null;
@@ -1469,6 +1471,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     rooms: {},
     extensions: {},
   };
+  let receiptRoomIds: string[] = [];
 
   if (body.txn_id) {
     response.txn_id = body.txn_id;
@@ -1745,6 +1748,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         roomIdsToFetch = [...new Set([...roomIdsToFetch, ...subscribedRoomIds])];
       }
 
+      receiptRoomIds = roomIdsToFetch;
       if (roomIdsToFetch.length > 0) {
         // Pass userId to filter m.read.private receipts
         const receiptsByRoom = await getReceiptsForRooms(c.env, roomIdsToFetch, userId);
@@ -1803,6 +1807,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
 
     // Fallback: Include receipts for all user's rooms - uses Room Durable Objects
     // Pass userId to filter m.read.private receipts
+    receiptRoomIds = userRoomIds;
     const receiptsByRoom = await getReceiptsForRooms(c.env, userRoomIds, userId);
 
     response.extensions.receipts = { rooms: {} };
@@ -1839,7 +1844,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Always advance position to prevent client re-sync loops
   // Previously we only set pos when hasChanges, but this caused clients to receive
   // the same pos twice and immediately re-sync, thinking it was stale
-  response.pos = `${currentStreamPos}_dk${currentKeys}`;
+  response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}`;
   connectionState.pos = currentStreamPos;
 
   // Mark initial sync as complete so ephemeral fallback doesn't run again on reconnects
@@ -1865,7 +1870,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Verification and encryption-key messages are changes even when no room
   // timeline changed. Never hold a ready device message for the poll timeout.
   hasChanges ||= (response.extensions.to_device?.events.length ?? 0) > 0 ||
-    (response.extensions.e2ee?.device_lists?.changed.length ?? 0) > 0;
+    (response.extensions.e2ee?.device_lists?.changed.length ?? 0) > 0 ||
+    (!!response.extensions.receipts && currentReceipts > parseSyncPosition(posToken).receipts);
 
   // Long-polling: if no changes and timeout > 0, wait for events via Durable Object
   // The SyncDurableObject will wake us up when events arrive for this user
@@ -1879,7 +1885,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ timeout, userId, deviceId: body.extensions?.to_device ? c.get('deviceId') : undefined,
-          toDeviceSince: body.extensions?.to_device?.since }),
+          toDeviceSince: body.extensions?.to_device?.since,
+          receiptsSince: response.extensions.receipts ? currentReceipts : undefined }),
       }));
       const waitResult = await waitResponse.json() as { hasEvents: boolean };
 
@@ -1891,11 +1898,17 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
           response.extensions.to_device = { events: result.events, next_batch: result.nextBatch };
         }
         if (body.extensions?.e2ee && response.extensions.e2ee) {
-          const latestKeys = await deviceKeyPosition(db);
-          const changed = await changedDeviceUsers(db, userId, parseSyncPosition(posToken).keys, latestKeys);
+          currentKeys = await deviceKeyPosition(db);
+          const changed = await changedDeviceUsers(db, userId, parseSyncPosition(posToken).keys, currentKeys);
           response.extensions.e2ee.device_lists = {changed, left:[]};
-          response.pos = `${currentStreamPos}_dk${latestKeys}`;
         }
+        if (response.extensions.receipts) {
+          currentReceipts = await receiptPosition(db);
+          const receipts = await getReceiptsForRooms(c.env, receiptRoomIds, userId);
+          response.extensions.receipts = { rooms: Object.fromEntries(Object.entries(receipts)
+            .map(([roomId, content]) => [roomId, { type: 'm.receipt', content }])) };
+        }
+        response.pos = `${currentStreamPos}_dk${currentKeys}${currentReceipts ? `_rr${currentReceipts}` : ''}`;
       } else {
         console.log('[sliding-sync] Wait timed out, no new events');
       }

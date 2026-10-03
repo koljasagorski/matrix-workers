@@ -11,13 +11,15 @@ interface FederationTarget {
   lastContact: number;
   retryCount: number;
   nextRetry: number | null;
+  lastError?: string;
+  rejectedEvents?: number;
 }
 
 interface OutboundEvent {
   event_id: string;
   room_id: string;
   destination: string;
-  pdu: any;
+  pdu: Record<string, unknown>;
   created_at: number;
   retry_count: number;
 }
@@ -25,9 +27,25 @@ interface OutboundEvent {
 interface OutboundEdu {
   edu_type: string;
   destination: string;
-  content: any;
+  content: Record<string, unknown>;
   created_at: number;
 }
+
+interface PendingTransaction {
+  transactionId: string;
+  destination: string;
+  eventKeys: string[];
+  eduKeys: string[];
+  originServerTs: number;
+}
+
+interface RejectedEvent extends OutboundEvent {
+  transaction_id: string;
+  rejected_at: number;
+  error: string;
+}
+
+const MAX_REJECTED_EVENTS = 100;
 
 export class FederationDurableObject extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -67,7 +85,7 @@ export class FederationDurableObject extends DurableObject<Env> {
       destination: string;
       event_id: string;
       room_id: string;
-      pdu: any;
+      pdu: Record<string, unknown>;
     };
 
     const outboundEvent: OutboundEvent = {
@@ -81,10 +99,11 @@ export class FederationDurableObject extends DurableObject<Env> {
 
     // Store in queue
     const key = `queue:${data.destination}:${data.event_id}`;
-    await this.ctx.storage.put(key, outboundEvent);
-
-    // Persist before responding; delivery survives the originating HTTP request.
-    await this.ctx.storage.setAlarm(Date.now() + 1);
+    await this.ctx.storage.transaction(async storage => {
+      // Queue entries referenced by an in-flight transaction must remain immutable.
+      if (!await storage.get(key)) await storage.put(key, outboundEvent);
+      await this.scheduleDestination(storage, data.destination);
+    });
 
     return new Response('Queued');
   }
@@ -218,7 +237,7 @@ export class FederationDurableObject extends DurableObject<Env> {
     const data = await request.json() as {
       destination: string;
       edu_type: string;
-      content: any;
+      content: Record<string, unknown>;
     };
 
     const edu: OutboundEdu = {
@@ -229,86 +248,110 @@ export class FederationDurableObject extends DurableObject<Env> {
     };
 
     // Store in EDU queue
-    const key = `edu:${data.destination}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-    await this.ctx.storage.put(key, edu);
-
-    // Persist before responding; delivery survives the originating HTTP request.
-    await this.ctx.storage.setAlarm(Date.now() + 1);
+    const key = `edu:${data.destination}:${edu.created_at}:${crypto.randomUUID()}`;
+    await this.ctx.storage.transaction(async storage => {
+      await storage.put(key, edu);
+      await this.scheduleDestination(storage, data.destination);
+    });
 
     return new Response('Queued');
   }
 
+  private async scheduleDestination(storage: DurableObjectTransaction, destination: string): Promise<void> {
+    const target = await storage.get<FederationTarget>(`server:${destination}`);
+    const due = Math.max(Date.now() + 1, target?.nextRetry ?? 0);
+    const current = await storage.getAlarm();
+    if (current === null || due < current) await storage.setAlarm(due);
+  }
+
+  private async getPendingTransaction(destination: string): Promise<PendingTransaction | undefined> {
+    const key = `transaction:${destination}`;
+    const existing = await this.ctx.storage.get<PendingTransaction>(key);
+    if (existing) return existing;
+
+    // Sort entries together with their keys so the exact transmitted EDUs are acknowledged.
+    const events = [...await this.ctx.storage.list<OutboundEvent>({ prefix: `queue:${destination}:` })]
+      .sort(([aKey, a], [bKey, b]) => a.created_at - b.created_at || aKey.localeCompare(bKey)).slice(0, 50);
+    const edus = [...await this.ctx.storage.list<OutboundEdu>({ prefix: `edu:${destination}:` })]
+      .sort(([aKey, a], [bKey, b]) => a.created_at - b.created_at || aKey.localeCompare(bKey)).slice(0, 100);
+    if (!events.length && !edus.length) return;
+
+    const transaction: PendingTransaction = {
+      transactionId: await sha256(JSON.stringify([events.map(([, event]) => event.event_id), edus.map(([eduKey]) => eduKey)])),
+      destination,
+      eventKeys: events.map(([eventKey]) => eventKey),
+      eduKeys: edus.map(([eduKey]) => eduKey),
+      originServerTs: events[0]?.[1].created_at ?? edus[0][1].created_at,
+    };
+    // Persist the batch before network I/O. New arrivals cannot change a retried transaction.
+    // Store references rather than a duplicate payload to stay below the per-value storage limit.
+    await this.ctx.storage.put(key, transaction);
+    return transaction;
+  }
+
   private async processFederationQueue(destination: string): Promise<void> {
-    const prefix = `queue:${destination}:`;
-    const allKeys = await this.ctx.storage.list({ prefix });
-
-    const events: OutboundEvent[] = [];
-    for (const [, value] of allKeys) {
-      events.push(value as OutboundEvent);
+    const transaction = await this.getPendingTransaction(destination);
+    if (!transaction) return;
+    const storedEvents = transaction.eventKeys.length
+      ? await this.ctx.storage.get<OutboundEvent>(transaction.eventKeys) : new Map<string, OutboundEvent>();
+    const storedEdus = transaction.eduKeys.length
+      ? await this.ctx.storage.get<OutboundEdu>(transaction.eduKeys) : new Map<string, OutboundEdu>();
+    const events = transaction.eventKeys.map(key => storedEvents.get(key));
+    const edus = transaction.eduKeys.map(key => storedEdus.get(key));
+    if (events.some(event => !event) || edus.some(edu => !edu)) {
+      throw new Error('Federation transaction references a missing queue entry');
     }
-
-    // Collect pending EDUs
-    const eduPrefix = `edu:${destination}:`;
-    const eduKeys = await this.ctx.storage.list({ prefix: eduPrefix });
-    const edus: OutboundEdu[] = [];
-    const eduKeyNames: string[] = [];
-    for (const [key, value] of eduKeys) {
-      edus.push(value as OutboundEdu);
-      eduKeyNames.push(key);
-    }
-
-    if (events.length === 0 && edus.length === 0) return;
-
-    // Sort by creation time
-    events.sort((a, b) => a.created_at - b.created_at);
-    edus.sort((a, b) => a.created_at - b.created_at);
-
-    // Batch events for transmission
-    const pdus = events.map(e => e.pdu);
-    const eduPayloads = edus.map(e => ({
-      edu_type: e.edu_type,
-      content: e.content,
-    }));
+    const batchEvents = events as OutboundEvent[];
+    const batchEdus = edus as OutboundEdu[];
 
     try {
       const response = await federationPut(destination,
-        `/_matrix/federation/v1/send/${await sha256(JSON.stringify([events.slice(0,50).map(e=>e.event_id),eduKeyNames.slice(0,100)]))}`,
-        { origin: this.env.SERVER_NAME, origin_server_ts: events[0]?.created_at ?? edus[0].created_at, pdus: pdus.slice(0, 50), edus: eduPayloads.slice(0, 100) },
+        `/_matrix/federation/v1/send/${transaction.transactionId}`,
+        { origin: this.env.SERVER_NAME, origin_server_ts: transaction.originServerTs,
+          pdus: batchEvents.map(event => event.pdu),
+          edus: batchEdus.map(edu => ({ edu_type: edu.edu_type, content: edu.content })) },
         this.env.SERVER_NAME, this.env.DB, this.env.CACHE);
 
-      if (response.ok) {
-        const result = await readFederationJson(response) as { pdus?: Record<string, {error?: string}> };
-        if (Object.values(result.pdus ?? {}).some(pdu => pdu.error)) throw new Error('Remote server rejected federation event');
-        // Remove sent events from queue
-        for (const event of events.slice(0, 50)) {
-          await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
-        }
-        // Remove sent EDUs
-        for (const key of eduKeyNames.slice(0, 100)) {
-          await this.ctx.storage.delete(key);
-        }
-
-        if (events.length > 50 || edus.length > 100) await this.ctx.storage.setAlarm(Date.now() + 1000);
-
-        // Update server status
-        const target: FederationTarget = {
-          serverName: destination,
-          lastContact: Date.now(),
-          retryCount: 0,
-          nextRetry: null,
-        };
-        await this.ctx.storage.put(`server:${destination}`, target);
-      } else {
-        // Schedule retry
-        await this.scheduleRetry(destination, events);
+      if (!response.ok) {
+        await response.body?.cancel();
+        await this.scheduleRetry(destination, `HTTP ${response.status}`);
+        return;
       }
-    } catch (e) {
-      console.error(`Federation send to ${destination} failed:`, e);
-      await this.scheduleRetry(destination, events);
+
+      const result = await readFederationJson(response) as { pdus?: Record<string, { error?: string }> };
+      const rejected = batchEvents.filter(event => typeof result.pdus?.[event.event_id]?.error === 'string');
+      await this.ctx.storage.transaction(async storage => {
+        const now = Date.now();
+        for (const event of rejected) {
+          const error = result.pdus![event.event_id].error!.slice(0, 2048);
+          const entry: RejectedEvent = { ...event, transaction_id: transaction.transactionId, rejected_at: now, error };
+          await storage.put(`rejected:${destination}:${String(now).padStart(13, '0')}:${event.event_id}`, entry);
+        }
+        const rejectedKeys = await storage.list({ prefix: `rejected:${destination}:` });
+        const excess = [...rejectedKeys.keys()].slice(0, Math.max(0, rejectedKeys.size - MAX_REJECTED_EVENTS));
+        if (excess.length) await storage.delete(excess);
+        // HTTP 200 completes a transaction even if individual PDUs were rejected. Retrying
+        // that transaction returns the same result and blocks all subsequent messages/EDUs.
+        await storage.delete([...transaction.eventKeys, `transaction:${destination}`]);
+        if (transaction.eduKeys.length) await storage.delete(transaction.eduKeys);
+        const previous = await storage.get<FederationTarget>(`server:${destination}`);
+        await storage.put(`server:${destination}`, {
+          serverName: destination, lastContact: now, retryCount: 0, nextRetry: null,
+          rejectedEvents: (previous?.rejectedEvents ?? 0) + rejected.length,
+          ...(rejected.length ? { lastError: `${rejected.length} PDU(s) rejected` } : {}),
+        } satisfies FederationTarget);
+      });
+      for (const event of rejected) {
+        console.warn(JSON.stringify({ event: 'federation_pdu_rejected', destination, event_id: event.event_id,
+          transaction_id: transaction.transactionId, error: result.pdus![event.event_id].error!.slice(0, 2048) }));
+      }
+    } catch (error) {
+      console.error(`Federation send to ${destination} failed:`, error);
+      await this.scheduleRetry(destination, error instanceof Error ? error.message : 'Federation request failed');
     }
   }
 
-  private async scheduleRetry(destination: string, events: OutboundEvent[]): Promise<void> {
+  private async scheduleRetry(destination: string, error: string): Promise<void> {
     const target = await this.ctx.storage.get(`server:${destination}`) as FederationTarget | undefined;
     const retryCount = (target?.retryCount || 0) + 1;
 
@@ -322,31 +365,30 @@ export class FederationDurableObject extends DurableObject<Env> {
       lastContact: target?.lastContact || 0,
       retryCount,
       nextRetry,
+      lastError: error.slice(0, 2048),
+      rejectedEvents: target?.rejectedEvents ?? 0,
     };
     await this.ctx.storage.put(`server:${destination}`, newTarget);
 
-    // Update events with retry count
-    for (const event of events) {
-      event.retry_count = retryCount;
-      await this.ctx.storage.put(`queue:${destination}:${event.event_id}`, event);
-    }
-
-    // Set alarm for retry
-    await this.ctx.storage.setAlarm(nextRetry);
+    // The alarm handler selects the earliest pending destination after processing all batches.
   }
 
   async alarm(): Promise<void> {
     const pending = [...(await this.ctx.storage.list<OutboundEvent>({ prefix:'queue:' })).values(),
       ...(await this.ctx.storage.list<OutboundEdu>({ prefix:'edu:' })).values()];
-    let next: number | undefined;
     for (const destination of new Set(pending.map(item => item.destination))) {
       const target = await this.ctx.storage.get<FederationTarget>(`server:${destination}`);
       if (!target?.nextRetry || target.nextRetry <= Date.now()) await this.processFederationQueue(destination);
-      else next = Math.min(next ?? Infinity, target.nextRetry);
     }
-    if (next) {
-      const current = await this.ctx.storage.getAlarm();
-      if (!current || next < current) await this.ctx.storage.setAlarm(next);
+
+    // Re-read after delivery: arrivals during network I/O and batches beyond 50/100 remain queued.
+    const remaining = [...(await this.ctx.storage.list<OutboundEvent>({ prefix: 'queue:' })).values(),
+      ...(await this.ctx.storage.list<OutboundEdu>({ prefix: 'edu:' })).values()];
+    let next: number | undefined;
+    for (const destination of new Set(remaining.map(item => item.destination))) {
+      const target = await this.ctx.storage.get<FederationTarget>(`server:${destination}`);
+      next = Math.min(next ?? Infinity, Math.max(Date.now() + 1000, target?.nextRetry ?? 0));
     }
+    if (next !== undefined) await this.ctx.storage.setAlarm(next);
   }
 }

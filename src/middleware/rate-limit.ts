@@ -20,12 +20,20 @@ const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
   create_room: { requests: 10, windowMs: 60 * 1000 }, // 10 per minute
 };
 
+function isSyncEndpoint(path: string, method: string): boolean {
+  if (method === 'GET') return path === '/_matrix/client/v3/sync';
+  if (method !== 'POST') return false;
+  return path === '/_matrix/client/v4/sync'
+    || path === '/_matrix/client/unstable/org.matrix.msc3575/sync'
+    || path === '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync';
+}
+
 function getRateLimitType(path: string, method: string): string {
   if (path.startsWith('/oauth/authorize') && method === 'POST') return 'login';
   if (path === '/oauth/token' && method === 'POST') return 'login';
   if (path.includes('/login') && method === 'POST') return 'login';
   if (path.includes('/register') && method === 'POST') return 'register';
-  if (path.includes('/sync')) return 'sync';
+  if (isSyncEndpoint(path, method)) return 'sync';
   if (path.includes('/keys/')) return 'e2ee';
   if (path.includes('/media') || path.includes('/upload')) {
     return method === 'POST' || method === 'PUT' ? 'media_upload' : 'media_download';
@@ -63,9 +71,9 @@ export async function rateLimitMiddleware(c: Context<AppEnv>, next: Next) {
     return next();
   }
 
-  // Skip rate limiting for sync endpoints with long timeout
-  // These have natural rate limiting via the timeout parameter
-  if (path.includes('/sync')) {
+  // Preserve the long-poll exemption only for implemented sync endpoints. Arbitrary
+  // event types and room state keys containing /sync must still be rate limited.
+  if (isSyncEndpoint(path, method)) {
     return next();
   }
 

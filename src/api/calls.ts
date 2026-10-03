@@ -7,11 +7,18 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { isCallsConfigured } from '../services/cloudflare-calls';
 import { generateOpaqueId } from '../utils/ids';
+import { getMembership } from '../services/database';
+import { buildLocalRoomEvent, persistLocalRoomEvent } from '../services/local-room-events';
 
 const app = new Hono<AppEnv>();
+app.onError((error) => {
+  if (error instanceof MatrixApiError) return error.toResponse();
+  console.error('[calls] Request failed:', error);
+  return Errors.unknown().toResponse();
+});
 
 // ============================================
 // Call Management API
@@ -21,6 +28,9 @@ const app = new Hono<AppEnv>();
 app.get('/_matrix/client/v3/rooms/:roomId/call', requireAuth(), async (c) => {
   const roomId = decodeURIComponent(c.req.param('roomId'));
   const db = c.env.DB;
+  if ((await getMembership(db, roomId, c.get('userId')))?.membership !== 'join') {
+    return Errors.forbidden('Not a member of this room').toResponse();
+  }
 
   // Check if Calls is configured
   if (!isCallsConfigured(c.env)) {
@@ -115,16 +125,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/call/start', requireAuth(), async (c)
   const callRoomId = c.env.CALL_ROOMS.idFromName(`${roomId}:${callId}`);
   const callRoom = c.env.CALL_ROOMS.get(callRoomId);
 
-  // Initialize the call room
-  await callRoom.fetch(new Request('http://internal/init', {
-    method: 'POST',
-    body: JSON.stringify({
-      roomId,
-      callId,
-    }),
-  }));
-
-  // Store call state in room state (simplified - in production would be a proper event)
   const callStateContent = {
     active: true,
     call_id: callId,
@@ -132,21 +132,19 @@ app.post('/_matrix/client/v3/rooms/:roomId/call/start', requireAuth(), async (c)
     started_at: Date.now(),
     participants: [],
   };
-
-  // For now, just store in a simple way
-  // In production, this would be a proper Matrix state event
-  await db.prepare(`
-    INSERT INTO room_state (room_id, event_type, state_key, event_id)
-    VALUES (?, 'm.call.state', '', ?)
-    ON CONFLICT (room_id, event_type, state_key) DO UPDATE SET
-      event_id = excluded.event_id
-  `).bind(roomId, `call_${callId}`).run();
-
-  // Create a minimal event record
-  await db.prepare(`
-    INSERT OR REPLACE INTO events (event_id, room_id, type, sender, content, origin_server_ts)
-    VALUES (?, ?, 'm.call.state', ?, ?, ?)
-  `).bind(`call_${callId}`, roomId, userId, JSON.stringify(callStateContent), Date.now()).run();
+  // Authorize the room change before starting the SFU session.
+  const built = await buildLocalRoomEvent(c.env, {
+    roomId, sender: userId, type: 'm.call.state', stateKey: '', content: callStateContent,
+  });
+  const initialized = await callRoom.fetch(new Request('http://internal/init', {
+    method: 'POST',
+    body: JSON.stringify({
+      roomId,
+      callId,
+    }),
+  }));
+  if (!initialized.ok) throw Errors.unknown('Could not initialize the call');
+  await persistLocalRoomEvent(c.env, built.event, built.version);
 
   return c.json({
     callId,
@@ -159,6 +157,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/call/end', requireAuth(), async (c) =
   const userId = c.get('userId');
   const roomId = decodeURIComponent(c.req.param('roomId'));
   const db = c.env.DB;
+  if ((await getMembership(db, roomId, userId))?.membership !== 'join') {
+    return Errors.forbidden('Not a member of this room').toResponse();
+  }
 
   // Check if Calls is configured
   if (!isCallsConfigured(c.env)) {
@@ -199,28 +200,28 @@ app.post('/_matrix/client/v3/rooms/:roomId/call/end', requireAuth(), async (c) =
     }, 404);
   }
 
+  const built = await buildLocalRoomEvent(c.env, {
+    roomId, sender: userId, type: 'm.call.state', stateKey: '',
+    content: { ...callContent, active: false, ended_at: Date.now(), ended_by: userId },
+  });
+
   // End the call in the Durable Object
   if (c.env.CALL_ROOMS) {
     const callRoomId = c.env.CALL_ROOMS.idFromName(`${roomId}:${callContent.call_id}`);
     const callRoom = c.env.CALL_ROOMS.get(callRoomId);
 
     try {
-      await callRoom.fetch(new Request('http://internal/end', {
+      const ended = await callRoom.fetch(new Request('http://internal/end', {
         method: 'POST',
       }));
-    } catch {
-      // Ignore errors ending the call
+      if (!ended.ok) throw Errors.unknown('Could not end the call');
+    } catch (error) {
+      if (error instanceof MatrixApiError) throw error;
+      throw Errors.unknown('Could not end the call');
     }
   }
 
-  // Update call state
-  callContent.active = false;
-  callContent.ended_at = Date.now();
-  callContent.ended_by = userId;
-
-  await db.prepare(`
-    UPDATE events SET content = ? WHERE event_id = ?
-  `).bind(JSON.stringify(callContent), callState.event_id).run();
+  await persistLocalRoomEvent(c.env, built.event, built.version);
 
   return c.json({ success: true });
 });
@@ -230,7 +231,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/call/end', requireAuth(), async (c) =
 // ============================================
 
 // GET /calls/:callId/ws - WebSocket connection for call signaling
-app.get('/calls/:callId/ws', async (c) => {
+app.get('/calls/:callId/ws', requireAuth(), async (c) => {
   const callId = c.req.param('callId');
 
   // Check if Calls is configured
@@ -248,13 +249,13 @@ app.get('/calls/:callId/ws', async (c) => {
     }, 500);
   }
 
-  // Find the call by looking through room states
-  // In production, you'd have a proper mapping
   const db = c.env.DB;
   const callEvent = await db.prepare(`
-    SELECT room_id, content FROM events
-    WHERE event_id = ? AND type = 'm.call.state'
-  `).bind(`call_${callId}`).first<{ room_id: string; content: string }>();
+    SELECT e.room_id, e.content FROM room_state rs
+    JOIN events e ON e.event_id = rs.event_id
+    WHERE rs.event_type = 'm.call.state' AND rs.state_key = ''
+      AND json_extract(e.content, '$.call_id') = ? AND json_extract(e.content, '$.active') = 1
+  `).bind(callId).first<{ room_id: string; content: string }>();
 
   if (!callEvent) {
     return c.json({
@@ -264,14 +265,23 @@ app.get('/calls/:callId/ws', async (c) => {
   }
 
   const roomId = callEvent.room_id;
+  if ((await getMembership(db, roomId, c.get('userId')))?.membership !== 'join') {
+    return Errors.forbidden('Not a member of this room').toResponse();
+  }
+  const deviceId = c.get('deviceId');
+  if (!deviceId) return Errors.forbidden('A device-scoped access token is required for calls').toResponse();
 
   // Get the CallRoom Durable Object
   const callRoomId = c.env.CALL_ROOMS.idFromName(`${roomId}:${callId}`);
   const callRoom = c.env.CALL_ROOMS.get(callRoomId);
 
   // Proxy the WebSocket request to the Durable Object
+  const internalHeaders = new Headers(c.req.raw.headers);
+  internalHeaders.set('X-Matrix-Call-User', c.get('userId'));
+  internalHeaders.set('X-Matrix-Call-Device', deviceId);
+  internalHeaders.delete('Authorization');
   return callRoom.fetch(new Request(`http://internal/ws`, {
-    headers: c.req.raw.headers,
+    headers: internalHeaders,
   }));
 });
 

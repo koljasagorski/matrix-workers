@@ -237,7 +237,7 @@ export class SyncDurableObject extends DurableObject<Env> {
     let myResolver: ((hasEvents: boolean) => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const body = await request.json() as { timeout?: number; userId?: string; deviceId?: string; toDeviceSince?: string };
+      const body = await request.json() as { timeout?: number; userId?: string; deviceId?: string; toDeviceSince?: string; receiptsSince?: number };
       const timeout = Math.min(body.timeout || 25000, 25000); // Cap at 25s
 
       console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.length);
@@ -255,6 +255,10 @@ export class SyncDurableObject extends DurableObject<Env> {
           AND recipient_device_id=? AND delivered=0 AND stream_position>? LIMIT 1`)
           .bind(body.userId, body.deviceId, Number(body.toDeviceSince ?? '0')).first();
         if (queued && myResolver) (myResolver as (ready: boolean) => void)(true);
+      }
+      if (Number.isSafeInteger(body.receiptsSince)) {
+        const receipts = await this.env.DB.prepare("SELECT position FROM stream_positions WHERE stream_name='receipts'").first<{ position: number }>();
+        if ((receipts?.position ?? 0) > body.receiptsSince! && myResolver) (myResolver as (ready: boolean) => void)(true);
       }
 
       const timeoutPromise = new Promise<boolean>((resolve) => {

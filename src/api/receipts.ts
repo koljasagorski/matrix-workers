@@ -11,6 +11,8 @@ import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { publishReadReceipt } from '../services/read-receipts';
+import { isObject } from '../services/federation-events';
 
 const app = new Hono<AppEnv>();
 
@@ -57,11 +59,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
 
   // Parse optional body for thread_id
   let threadId: string | undefined;
-  try {
-    const body = await c.req.json();
-    threadId = body.thread_id;
-  } catch {
-    // Body is optional
+  const text = await c.req.text();
+  if (text) {
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { return Errors.badJson().toResponse(); }
+    if (!isObject(body)) return Errors.badJson().toResponse();
+    if (body.thread_id !== undefined && (typeof body.thread_id !== 'string' || !body.thread_id)) {
+      return Errors.invalidParam('thread_id').toResponse();
+    }
+    threadId = body.thread_id as string | undefined;
   }
 
   // m.fully_read is special - it's room account data, not an ephemeral receipt
@@ -76,22 +82,13 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     console.log('[receipts] Stored m.fully_read in account_data for', userId, 'in room', roomId, 'event', eventId);
   } else {
     // Store m.read and m.read.private in Room Durable Object
-    const roomDO = getRoomDO(c.env, roomId);
-    await roomDO.fetch(new Request('https://room/receipt', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: userId,
-        event_id: eventId,
-        receipt_type: receiptType,
-        thread_id: threadId,
-      }),
-    }));
+    await publishReadReceipt(c.env, roomId, { user_id: userId, event_id: eventId,
+      receipt_type: receiptType as 'm.read' | 'm.read.private', thread_id: threadId, ts: Date.now() });
     console.log('[receipts] Stored', receiptType, 'in Room DO for', userId, 'in room', roomId, 'event', eventId);
 
     // Also update m.fully_read when m.read is set - Element X uses m.fully_read for unread counts
     // This keeps the read marker in sync with the read receipt
-    if (receiptType === 'm.read') {
+    if (receiptType === 'm.read' && threadId === undefined) {
       await db.prepare(`
         INSERT INTO account_data (user_id, room_id, event_type, content)
         VALUES (?, ?, 'm.fully_read', ?)
@@ -121,6 +118,12 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
   } catch {
     return Errors.badJson().toResponse();
   }
+  if (!isObject(body)) return Errors.badJson().toResponse();
+  for (const key of ['m.read', 'm.read.private', 'm.fully_read'] as const) {
+    if (body[key] !== undefined && (typeof body[key] !== 'string' || !body[key]!.startsWith('$'))) {
+      return Errors.invalidParam(key).toResponse();
+    }
+  }
 
   // Check membership
   const membership = await db.prepare(`
@@ -142,19 +145,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
     console.log('[receipts] Stored m.fully_read in account_data for', userId, 'in room', roomId);
   }
 
-  const roomDO = getRoomDO(c.env, roomId);
-
   // Process m.read (stored in Room DO)
   if (body['m.read']) {
-    await roomDO.fetch(new Request('https://room/receipt', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: userId,
-        event_id: body['m.read'],
-        receipt_type: 'm.read',
-      }),
-    }));
+    await publishReadReceipt(c.env, roomId, { user_id: userId, event_id: body['m.read'], receipt_type: 'm.read', ts: Date.now() });
 
     // If m.fully_read wasn't explicitly provided, also update it to match m.read
     // This keeps unread counts in sync for clients that only send m.read
@@ -171,15 +164,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 
   // Process m.read.private (stored in Room DO)
   if (body['m.read.private']) {
-    await roomDO.fetch(new Request('https://room/receipt', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: userId,
-        event_id: body['m.read.private'],
-        receipt_type: 'm.read.private',
-      }),
-    }));
+    await publishReadReceipt(c.env, roomId, { user_id: userId, event_id: body['m.read.private'], receipt_type: 'm.read.private', ts: Date.now() });
   }
 
   return c.json({});
@@ -194,13 +179,16 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 export async function getReceiptsForRoom(
   env: Env,
   roomId: string,
-  requestingUserId?: string
+  requestingUserId: string
 ): Promise<{
   type: 'm.receipt';
   content: Record<string, Record<string, Record<string, { ts: number; thread_id?: string }>>>;
 }> {
+  const membership = await env.DB.prepare('SELECT membership FROM room_memberships WHERE room_id=? AND user_id=?')
+    .bind(roomId, requestingUserId).first<{ membership: string }>();
+  if (membership?.membership !== 'join') return { type: 'm.receipt', content: {} };
   const roomDO = getRoomDO(env, roomId);
-  const response = await roomDO.fetch(new Request('https://room/receipts', {
+  const response = await roomDO.fetch(new Request(`https://room/receipts?room_id=${encodeURIComponent(roomId)}`, {
     method: 'GET',
   }));
 
@@ -252,7 +240,7 @@ export async function getReceiptsForRoom(
 export async function getReceiptsForRooms(
   env: Env,
   roomIds: string[],
-  requestingUserId?: string
+  requestingUserId: string
 ): Promise<Record<string, Record<string, Record<string, Record<string, { ts: number; thread_id?: string }>>>>> {
   if (roomIds.length === 0) return {};
 

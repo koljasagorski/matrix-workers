@@ -13,6 +13,7 @@ export function memoryKV() {
 }
 export async function testEnv() {
   const sqlite = new DatabaseSync(':memory:');
+  let batchQueue: Promise<unknown> = Promise.resolve();
   for (const f of readdirSync('migrations').filter(f => f.endsWith('.sql')).sort()) sqlite.exec(readFileSync(`migrations/${f}`, 'utf8'));
   function prepare(sql: string, args: (string | number | null)[] = []): any {
     return { bind: (...bound: (string | number | null)[]) => prepare(sql, bound),
@@ -28,9 +29,14 @@ export async function testEnv() {
   }
   const env = {
     SERVER_NAME: 'local.example', DB: { prepare, batch: async (statements: { run(): Promise<unknown> }[]) => {
-      sqlite.exec('BEGIN');
-      try { const results = []; for (const s of statements) results.push(await s.run()); sqlite.exec('COMMIT'); return results; }
-      catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+      // Real D1 batches are serialized transactions, including across requests.
+      const result = batchQueue.then(async () => {
+        sqlite.exec('BEGIN');
+        try { const results = []; for (const s of statements) results.push(await s.run()); sqlite.exec('COMMIT'); return results; }
+        catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+      });
+      batchQueue = result.catch(() => {});
+      return result;
     } }, CACHE: memoryKV(), SESSIONS: memoryKV(),
     SYNC: { idFromName: (s: string) => s, get: () => ({ fetch: async () => Response.json({}) }) },
   } as unknown as Env;

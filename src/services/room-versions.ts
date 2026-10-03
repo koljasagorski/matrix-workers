@@ -196,7 +196,7 @@ export function getRoomVersion(version: string): RoomVersionBehavior | null {
 
 /** Check if a room version is supported */
 export function isRoomVersionSupported(version: string): boolean {
-  return version in ROOM_VERSIONS;
+  return ['10', '11', '12'].includes(version);
 }
 
 /** Get the default room version */
@@ -208,6 +208,7 @@ export function getDefaultRoomVersion(): string {
 export function getSupportedRoomVersions(): Record<string, 'stable' | 'unstable'> {
   const result: Record<string, 'stable' | 'unstable'> = {};
   for (const [version, behavior] of Object.entries(ROOM_VERSIONS)) {
+    if (!isRoomVersionSupported(version)) continue;
     result[version] = behavior.stable ? 'stable' : 'unstable';
   }
   return result;

@@ -34,6 +34,7 @@ function createBindings() {
   const prepare = (sql: string, args: SQLInputValue[] = []) => ({
     bind: (...bound: SQLInputValue[]) => prepare(sql, bound),
     first: async () => db.prepare(sql).get(...args) ?? null,
+    all: async () => ({ results: db.prepare(sql).all(...args), success: true }),
     run: async () => ({ success: true, meta: db.prepare(sql).run(...args) }),
   });
   return {

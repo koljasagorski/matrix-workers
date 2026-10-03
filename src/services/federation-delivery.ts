@@ -2,10 +2,13 @@ import type { Env, PDU } from '../types';
 import { parseUserId } from '../utils/ids';
 import { wireEvent } from './federation-events';
 
-export async function queueRoomEvent(env: Env, event: PDU, version: string) {
+export async function queueRoomEvent(env: Env, event: PDU, version: string, additionalServers: string[] = []) {
+  const create = await env.DB.prepare(`SELECT e.content FROM room_state rs JOIN events e ON e.event_id=rs.event_id
+    WHERE rs.room_id=? AND rs.event_type='m.room.create' AND rs.state_key=''`).bind(event.room_id).first<{ content: string }>();
+  if (create && JSON.parse(create.content)['m.federate'] === false) return;
   const members = await env.DB.prepare("SELECT user_id FROM room_memberships WHERE room_id=? AND membership='join'")
     .bind(event.room_id).all<{ user_id: string }>();
-  const servers = [...new Set(members.results.map(m => parseUserId(m.user_id)?.serverName))]
+  const servers = [...new Set([...members.results.map(m => parseUserId(m.user_id)?.serverName), ...additionalServers])]
     .filter((server): server is string => !!server && server !== env.SERVER_NAME);
   for (let i = 0; i < servers.length; i += 4) {
     await Promise.all(servers.slice(i, i + 4).map(async destination => {

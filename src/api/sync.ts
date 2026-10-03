@@ -17,6 +17,7 @@ import {
   getRoomAccountData,
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
+import { receiptPosition } from '../services/read-receipts';
 import { getTypingUsers } from './typing';
 import { getStoredInviteState } from '../services/remote-invites';
 import { initialRoomHistory } from '../services/sync-history';
@@ -198,11 +199,12 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Parse composite sync token (separate positions for events and to-device)
-  const { events: sincePosition, toDevice: sinceToDevice, keys: sinceKeys } = parseSyncPosition(since);
+  const { events: sincePosition, toDevice: sinceToDevice, keys: sinceKeys, receipts: sinceReceipts } = parseSyncPosition(since);
 
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
   let currentKeys = await deviceKeyPosition(c.env.DB);
+  let currentReceipts = await receiptPosition(c.env.DB);
 
   // Track to-device position for next_batch
   let currentToDevicePos = sinceToDevice;
@@ -490,7 +492,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;
   const hasToDevice = response.to_device!.events.length > 0;
   const hasAccountData = response.account_data!.events.length > 0;
-  const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData || keyChanges.length > 0;
+  const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData || keyChanges.length > 0 || currentReceipts > sinceReceipts;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
@@ -507,7 +509,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeout: waitTimeout, userId, deviceId, toDeviceSince: String(sinceToDevice) }),
+      body: JSON.stringify({ timeout: waitTimeout, userId, deviceId, toDeviceSince: String(sinceToDevice), receiptsSince: currentReceipts }),
     }));
 
     const waitResult = await waitResponse.json() as { hasEvents: boolean };
@@ -521,6 +523,15 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         currentToDevicePos = Number(updated.nextBatch);
       }
       currentKeys = await deviceKeyPosition(c.env.DB);
+      // Capture the receipt cursor before reading content so a concurrent update
+      // can be replayed, but never acknowledged without being returned.
+      currentReceipts = await receiptPosition(c.env.DB);
+      for (const roomId of Object.keys(response.rooms!.join!)) {
+        const ephemeral = response.rooms!.join![roomId].ephemeral!;
+        ephemeral.events = ephemeral.events.filter(event => event.type !== 'm.receipt');
+        const receipts = await getReceiptsForRoom(c.env, roomId, userId);
+        if (Object.keys(receipts.content).length) ephemeral.events.push(receipts);
+      }
       const changed = await changedDeviceUsers(c.env.DB, userId, sinceKeys, currentKeys);
       if (changed.length) response.device_lists = {changed, left:[]};
       // Room changes are read on the next request; their stream position stays
@@ -534,7 +545,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Build composite next_batch token with separate positions for each stream
   if (!response.next_batch) {
-    response.next_batch = syncPosition(currentPosition, currentToDevicePos, currentKeys);
+  response.next_batch = syncPosition(currentPosition, currentToDevicePos, currentKeys, currentReceipts);
   }
 
   return c.json(response);

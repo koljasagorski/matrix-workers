@@ -256,18 +256,15 @@ export async function getRoom(db: D1Database, roomId: string): Promise<Room | nu
 }
 
 // Event operations
-export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
-  // Get the next stream ordering
-  const lastOrdering = await db.prepare(
-    `SELECT MAX(stream_ordering) as max_ordering FROM events`
-  ).first<{ max_ordering: number | null }>();
-
-  const streamOrdering = (lastOrdering?.max_ordering ?? 0) + 1;
-
-  await db.prepare(
+export async function storeEvent(db: D1Database, event: PDU, relatedStatements: D1PreparedStatement[] = []): Promise<number> {
+  // Allocate the position inside the INSERT: separate reads can give concurrent
+  // events the same position and make a later /sync permanently skip one of them.
+  const statements = [db.prepare(
     `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, redacts, stream_ordering)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(stream_ordering), 0) + 1
+     FROM events
+     RETURNING stream_ordering`
   ).bind(
     event.event_id,
     event.room_id,
@@ -282,24 +279,27 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     JSON.stringify(event.prev_events),
     event.hashes ? JSON.stringify(event.hashes) : null,
     event.signatures ? JSON.stringify(event.signatures) : null,
-    streamOrdering
-  ).run();
+    event.redacts ?? null
+  )];
 
-  // Update room state if this is a state event
+  // A sync position must not become visible before its current state is stored.
+  // D1 batches commit all statements together and roll back on any failure.
   if (event.state_key !== undefined) {
-    await db.prepare(
+    statements.push(db.prepare(
       `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
        VALUES (?, ?, ?, ?)`
-    ).bind(event.room_id, event.type, event.state_key, event.event_id).run();
+    ).bind(event.room_id, event.type, event.state_key, event.event_id));
   }
 
-  return streamOrdering;
+  statements.push(...relatedStatements);
+  const results = await db.batch<{ stream_ordering: number }>(statements);
+  return results[0].results[0].stream_ordering;
 }
 
 export async function getEvent(db: D1Database, eventId: string): Promise<PDU | null> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, redacts
      FROM events WHERE event_id = ?`
   ).bind(eventId).first<{
     event_id: string;
@@ -315,6 +315,7 @@ export async function getEvent(db: D1Database, eventId: string): Promise<PDU | n
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
+    redacts: string | null;
   }>();
 
   if (!result) return null;
@@ -333,6 +334,7 @@ export async function getEvent(db: D1Database, eventId: string): Promise<PDU | n
     prev_events: JSON.parse(result.prev_events),
     hashes: result.hashes ? JSON.parse(result.hashes) : undefined,
     signatures: result.signatures ? JSON.parse(result.signatures) : undefined,
+    redacts: result.redacts ?? undefined,
   };
 }
 
@@ -378,6 +380,9 @@ export async function getRoomEvents(
     depth: number;
     auth_events: string;
     prev_events: string;
+    hashes: string | null;
+    signatures: string | null;
+    redacts: string | null;
     stream_ordering: number;
   }>();
 
@@ -393,6 +398,9 @@ export async function getRoomEvents(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
+    hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
+    signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+    redacts: r.redacts ?? undefined,
   }));
 
   const lastEvent = result.results[result.results.length - 1];
@@ -408,7 +416,7 @@ export async function getRoomState(
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures, e.redacts
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ?`
@@ -424,6 +432,9 @@ export async function getRoomState(
     depth: number;
     auth_events: string;
     prev_events: string;
+    hashes: string | null;
+    signatures: string | null;
+    redacts: string | null;
   }>();
 
   return result.results.map(r => ({
@@ -438,6 +449,9 @@ export async function getRoomState(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
+    hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
+    signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+    redacts: r.redacts ?? undefined,
   }));
 }
 
@@ -449,7 +463,7 @@ export async function getStateEvent(
 ): Promise<PDU | null> {
   const result = await db.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures, e.redacts
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ? AND rs.event_type = ? AND rs.state_key = ?`
@@ -465,6 +479,9 @@ export async function getStateEvent(
     depth: number;
     auth_events: string;
     prev_events: string;
+    hashes: string | null;
+    signatures: string | null;
+    redacts: string | null;
   }>();
 
   if (!result) return null;
@@ -481,6 +498,9 @@ export async function getStateEvent(
     depth: result.depth,
     auth_events: JSON.parse(result.auth_events),
     prev_events: JSON.parse(result.prev_events),
+    hashes: result.hashes ? JSON.parse(result.hashes) : undefined,
+    signatures: result.signatures ? JSON.parse(result.signatures) : undefined,
+    redacts: result.redacts ?? undefined,
   };
 }
 
@@ -648,7 +668,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
   const placeholders = eventIds.map(() => '?').join(', ');
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, redacts
      FROM events WHERE event_id IN (${placeholders})`
   ).bind(...eventIds).all<{
     event_id: string;
@@ -664,6 +684,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
+    redacts: string | null;
   }>();
 
   return result.results.map(r => ({
@@ -680,6 +701,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
     prev_events: JSON.parse(r.prev_events),
     hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
     signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+    redacts: r.redacts ?? undefined,
   }));
 }
 

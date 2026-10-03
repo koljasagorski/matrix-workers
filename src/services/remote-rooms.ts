@@ -143,11 +143,11 @@ export async function persistRemoteJoin(env: Env, version: string, events: PDU[]
     VALUES (?,?,?,0,?) ON CONFLICT(room_id) DO UPDATE SET room_version=excluded.room_version,creator_id=excluded.creator_id`).bind(join.room_id, version, create.sender, Date.now())];
   for (const event of new Map([...events, join].map(e => [e.event_id, e])).values()) {
     statements.push(db.prepare(`INSERT INTO events(event_id,room_id,sender,event_type,state_key,content,
-      origin_server_ts,depth,auth_events,prev_events,hashes,signatures,stream_ordering)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,${event.event_id === join.event_id ? '(SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events)' : 'NULL'})
+      origin_server_ts,depth,auth_events,prev_events,hashes,signatures,redacts,stream_ordering)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,${event.event_id === join.event_id ? '(SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events)' : 'NULL'})
       ON CONFLICT(event_id) DO NOTHING`).bind(event.event_id, join.room_id, event.sender, event.type,
         event.state_key ?? null, JSON.stringify(event.content), event.origin_server_ts, event.depth,
-        JSON.stringify(event.auth_events), JSON.stringify(event.prev_events), JSON.stringify(event.hashes), JSON.stringify(event.signatures)));
+        JSON.stringify(event.auth_events), JSON.stringify(event.prev_events), JSON.stringify(event.hashes), JSON.stringify(event.signatures), event.redacts ?? null));
   }
   // Only the returned current state updates room_state; historic auth events cannot replace it.
   for (const event of [...state, join]) {

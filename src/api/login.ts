@@ -23,11 +23,22 @@ import {
   deleteAllUserTokens,
 } from '../services/database';
 import { requireAuth, extractAccessToken } from '../middleware/auth';
+import { getAppServices, isExclusiveAppServiceUser } from '../services/appservice';
 
 const app = new Hono<AppEnv>();
 
 const ACCESS_TOKEN_LIFETIME_MS = 60 * 60 * 1000;
 const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+async function isReservedRegistrationUser(env: AppEnv['Bindings'], userId: string): Promise<boolean> {
+  const appservices = await getAppServices(env.DB);
+  return appservices.some(service => userId === formatUserId(service.sender_localpart, env.SERVER_NAME))
+    || isExclusiveAppServiceUser(appservices, userId) !== null;
+}
+
+function exclusiveUsernameResponse(): Response {
+  return Response.json({ errcode: 'M_EXCLUSIVE', error: 'Username is reserved by an application service' }, { status: 400 });
+}
 
 async function createSessionTokens(
   env: AppEnv['Bindings'],
@@ -283,6 +294,10 @@ app.get('/_matrix/client/v3/register/available', async (c) => {
     return Errors.invalidUsername('Username contains invalid characters').toResponse();
   }
 
+  if (await isReservedRegistrationUser(c.env, formatUserId(username, c.env.SERVER_NAME))) {
+    return exclusiveUsernameResponse();
+  }
+
   const existing = await getUserByLocalpart(c.env.DB, username);
   if (existing) {
     return Errors.userInUse().toResponse();
@@ -318,6 +333,13 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   const isGuest = kind === 'guest';
 
+  // Reservation checks must precede UIA and account creation. The AS sender is reserved
+  // even when it is not explicitly included in the configured user namespaces.
+  if (!isGuest && typeof username === 'string' && isValidLocalpart(username)
+    && await isReservedRegistrationUser(c.env, formatUserId(username, c.env.SERVER_NAME))) {
+    return exclusiveUsernameResponse();
+  }
+
   // For non-guests, require username and password
   if (!isGuest) {
     // Simple auth - in production, implement UIA (User-Interactive Authentication)
@@ -347,6 +369,10 @@ app.post('/_matrix/client/v3/register', async (c) => {
   // Generate localpart for guests
   const localpart = isGuest ? await generateOpaqueId(12) : username;
   const userId = formatUserId(localpart, c.env.SERVER_NAME);
+
+  if (isGuest && await isReservedRegistrationUser(c.env, userId)) {
+    return exclusiveUsernameResponse();
+  }
 
   // Check if user already exists
   const existing = await getUserById(c.env.DB, userId);

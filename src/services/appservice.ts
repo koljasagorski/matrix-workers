@@ -1,5 +1,7 @@
 // Application Service management
 
+import { parseUserId } from '../utils/ids';
+
 export interface AppServiceRegistration {
   id: string;
   url: string;
@@ -13,6 +15,21 @@ export interface AppServiceRegistration {
     rooms: Array<{ exclusive: boolean; regex: string }>;
     aliases: Array<{ exclusive: boolean; regex: string }>;
   };
+}
+
+/** Identity assertion is limited to the sender and local users in the AS namespace. */
+export function canAppServiceActAsUser(
+  appservice: AppServiceRegistration,
+  userId: string,
+  serverName: string
+): boolean {
+  const parsed = parseUserId(userId);
+  if (!parsed || parsed.serverName !== serverName) return false;
+  if (parsed.localpart === appservice.sender_localpart) return true;
+  return appservice.namespaces.users.some(namespace => {
+    try { return new RegExp(namespace.regex).test(userId); }
+    catch { return false; }
+  });
 }
 
 /** Get all registered application services */

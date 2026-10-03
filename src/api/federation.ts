@@ -21,6 +21,8 @@ import { federationGet } from '../services/federation-keys';
 import { readFederationJson } from '../services/federation-http';
 import { federationMediaResponse } from '../services/federation-media';
 import { receiveRemoteInvite } from '../services/remote-invites';
+import { receiveReadReceipts } from '../services/read-receipts';
+import { isServerAllowedInRoom } from '../services/server-acl';
 
 const app = new Hono<AppEnv>();
 
@@ -49,6 +51,7 @@ app.use('/_matrix/federation/v1/*', async (c, next) => {
   if (eventMatch) roomId = (await getEvent(c.env.DB, decodeURIComponent(eventMatch[1])))?.room_id;
   if (roomId) {
     const origin = c.get('federationOrigin' as any) as string;
+    if (!await isServerAllowedInRoom(c.env.DB, roomId, origin)) return Errors.forbidden('Origin server is denied by the room ACL').toResponse();
     const members = await c.env.DB.prepare("SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'")
       .bind(roomId).all<{ user_id: string }>();
     if (!members.results.some(m => parseUserId(m.user_id)?.serverName === origin)) {
@@ -536,6 +539,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       if (!isObject(raw) || typeof raw.room_id !== 'string') throw new Error('Missing room ID');
       const room = await getRoom(c.env.DB, raw.room_id);
       if (!room) throw new Error('Room not joined');
+      if (!await isServerAllowedInRoom(c.env.DB, room.room_id, origin)) throw new Error('Origin server is denied by the room ACL');
       const pdu = await verifyEvent(raw, room.room_version, room.room_id);
       eventId = pdu.event_id;
       if (await getEvent(c.env.DB, eventId)) { pduResults[eventId] = {}; continue; }
@@ -678,7 +682,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
 
         case 'm.receipt':
-          // Handle read receipts
+          await receiveReadReceipts(c.env, origin, content);
           break;
 
         case 'm.direct_to_device': {

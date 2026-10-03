@@ -5,12 +5,20 @@
 // important events like terms of service updates, security alerts, etc.
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
-import { Errors } from '../utils/errors';
+import type { AppEnv, Env } from '../types';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { generateOpaqueId, generateEventId } from '../utils/ids';
+import { generateOpaqueId, parseUserId } from '../utils/ids';
+import { sendLocalRoomEvent } from '../services/local-room-events';
+import { createRoom } from '../services/database';
+import { isObject } from '../services/federation-events';
 
 const app = new Hono<AppEnv>();
+app.onError((error) => {
+  if (error instanceof MatrixApiError) return error.toResponse();
+  console.error('[server-notices] Request failed:', error);
+  return Errors.unknown().toResponse();
+});
 
 // Server notice room configuration
 const SERVER_NOTICE_ROOM_TYPE = 'm.server_notice';
@@ -24,27 +32,21 @@ const SERVER_NOTICE_USER_LOCALPART = 'server';
 async function getServerNoticeUser(db: D1Database, serverName: string): Promise<string> {
   const userId = `@${SERVER_NOTICE_USER_LOCALPART}:${serverName}`;
 
-  const existing = await db.prepare(`
-    SELECT user_id FROM users WHERE user_id = ?
-  `).bind(userId).first();
-
-  if (!existing) {
-    // Create the server notice user
-    await db.prepare(`
-      INSERT INTO users (user_id, localpart, display_name, admin, is_guest, is_deactivated)
-      VALUES (?, ?, 'Server Notices', 0, 0, 0)
-    `).bind(userId, SERVER_NOTICE_USER_LOCALPART).run();
-  }
+  await db.prepare(`
+    INSERT OR IGNORE INTO users (user_id, localpart, display_name, admin, is_guest, is_deactivated)
+    VALUES (?, ?, 'Server Notices', 0, 0, 0)
+  `).bind(userId, SERVER_NOTICE_USER_LOCALPART).run();
 
   return userId;
 }
 
 // Get or create a server notice room for a user
 async function getOrCreateNoticeRoom(
-  db: D1Database,
-  serverName: string,
+  env: Env,
   targetUserId: string
 ): Promise<string> {
+  const db = env.DB;
+  const serverName = env.SERVER_NAME;
   // Check if user already has a server notice room
   const existing = await db.prepare(`
     SELECT rm.room_id FROM room_memberships rm
@@ -52,7 +54,7 @@ async function getOrCreateNoticeRoom(
     JOIN events e ON rs.event_id = e.event_id
     WHERE rm.user_id = ?
       AND rs.event_type = 'm.room.create'
-      AND e.content LIKE '%"type":"m.server_notice"%'
+      AND json_extract(e.content, '$.type') = 'm.server_notice'
     LIMIT 1
   `).bind(targetUserId).first<{ room_id: string }>();
 
@@ -63,13 +65,7 @@ async function getOrCreateNoticeRoom(
   // Create a new server notice room
   const serverUserId = await getServerNoticeUser(db, serverName);
   const roomId = `!${await generateOpaqueId(18)}:${serverName}`;
-  const now = Date.now();
-
-  // Create room
-  await db.prepare(`
-    INSERT INTO rooms (room_id, room_version, is_public, creator_id, created_at)
-    VALUES (?, '10', 0, ?, ?)
-  `).bind(roomId, serverUserId, now).run();
+  await createRoom(db, roomId, '10', serverUserId);
 
   // Create room events
   const events = [
@@ -80,7 +76,13 @@ async function getOrCreateNoticeRoom(
         creator: serverUserId,
         room_version: '10',
         type: SERVER_NOTICE_ROOM_TYPE,
+        'm.federate': false,
       },
+    },
+    {
+      type: 'm.room.member',
+      state_key: serverUserId,
+      content: { membership: 'join', displayname: 'Server Notices' },
     },
     {
       type: 'm.room.name',
@@ -116,15 +118,7 @@ async function getOrCreateNoticeRoom(
         ban: 50,
         kick: 50,
         redact: 50,
-        invite: 0,
-      },
-    },
-    {
-      type: 'm.room.member',
-      state_key: serverUserId,
-      content: {
-        membership: 'join',
-        displayname: 'Server Notices',
+        invite: 100,
       },
     },
     {
@@ -136,93 +130,30 @@ async function getOrCreateNoticeRoom(
     },
   ];
 
-  let depth = 1;
-  let prevEvents: string[] = [];
-  const authEvents: string[] = [];
-
   for (const event of events) {
-    const eventId = await generateEventId(serverName);
-
-    await db.prepare(`
-      INSERT INTO events (
-        event_id, room_id, sender, event_type, state_key, content,
-        origin_server_ts, depth, auth_events, prev_events
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      eventId,
-      roomId,
-      serverUserId,
-      event.type,
-      event.state_key,
-      JSON.stringify(event.content),
-      now + depth,
-      depth,
-      JSON.stringify(authEvents),
-      JSON.stringify(prevEvents)
-    ).run();
-
-    // Update room state
-    await db.prepare(`
-      INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-      VALUES (?, ?, ?, ?)
-    `).bind(roomId, event.type, event.state_key, eventId).run();
-
-    // Track auth events
-    if (['m.room.create', 'm.room.power_levels', 'm.room.join_rules'].includes(event.type)) {
-      authEvents.push(eventId);
-    }
-
-    prevEvents = [eventId];
-    depth++;
+    await sendLocalRoomEvent(env, {
+      roomId, sender: serverUserId, type: event.type, stateKey: event.state_key, content: event.content,
+    });
   }
-
-  // Create memberships
-  await db.prepare(`
-    INSERT INTO room_memberships (room_id, user_id, membership, event_id, display_name)
-    VALUES (?, ?, 'join', ?, 'Server Notices')
-  `).bind(roomId, serverUserId, prevEvents[0]).run();
-
-  await db.prepare(`
-    INSERT INTO room_memberships (room_id, user_id, membership, event_id)
-    VALUES (?, ?, 'invite', ?)
-  `).bind(roomId, targetUserId, prevEvents[0]).run();
 
   return roomId;
 }
 
 // Send a server notice to a user
 export async function sendServerNotice(
-  db: D1Database,
-  serverName: string,
+  env: Env,
   targetUserId: string,
   body: string,
   msgtype: string = 'm.text',
   adminContact?: string
 ): Promise<string> {
-  const roomId = await getOrCreateNoticeRoom(db, serverName, targetUserId);
-  const serverUserId = await getServerNoticeUser(db, serverName);
-  const eventId = await generateEventId(serverName);
-  const now = Date.now();
-
-  // Get latest event for prev_events
-  const latest = await db.prepare(`
-    SELECT event_id, depth FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1
-  `).bind(roomId).first<{ event_id: string; depth: number }>();
-
-  const depth = (latest?.depth || 0) + 1;
-  const prevEvents = latest ? [latest.event_id] : [];
-
-  // Get auth events
-  const authEventRows = await db.prepare(`
-    SELECT e.event_id FROM room_state rs
-    JOIN events e ON rs.event_id = e.event_id
-    WHERE rs.room_id = ? AND rs.event_type IN ('m.room.create', 'm.room.power_levels', 'm.room.member')
-    AND (rs.state_key = '' OR rs.state_key = ?)
-  `).bind(roomId, serverUserId).all<{ event_id: string }>();
-
-  const authEvents = authEventRows.results.map(r => r.event_id);
-
-  const content: Record<string, any> = {
+  if (parseUserId(targetUserId)?.serverName !== env.SERVER_NAME ||
+      !await env.DB.prepare('SELECT user_id FROM users WHERE user_id=? AND is_deactivated=0').bind(targetUserId).first()) {
+    throw Errors.notFound('Server notices require an active local user');
+  }
+  const roomId = await getOrCreateNoticeRoom(env, targetUserId);
+  const serverUserId = await getServerNoticeUser(env.DB, env.SERVER_NAME);
+  const content: Record<string, unknown> = {
     msgtype,
     body,
   };
@@ -234,23 +165,8 @@ export async function sendServerNotice(
   // Server notice specific content
   content['m.server_notice_type'] = 'm.server_notice.usage_limit_reached'; // or other types
 
-  await db.prepare(`
-    INSERT INTO events (
-      event_id, room_id, sender, event_type, content,
-      origin_server_ts, depth, auth_events, prev_events
-    ) VALUES (?, ?, ?, 'm.room.message', ?, ?, ?, ?, ?)
-  `).bind(
-    eventId,
-    roomId,
-    serverUserId,
-    JSON.stringify(content),
-    now,
-    depth,
-    JSON.stringify(authEvents),
-    JSON.stringify(prevEvents)
-  ).run();
-
-  return eventId;
+  const event = await sendLocalRoomEvent(env, { roomId, sender: serverUserId, type: 'm.room.message', content });
+  return event.event_id;
 }
 
 // ============================================
@@ -286,13 +202,15 @@ app.post('/_synapse/admin/v1/send_server_notice', requireAuth(), async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  if (!body.user_id || !body.content?.body) {
+  if (!isObject(body) || typeof body.user_id !== 'string' || !isObject(body.content) ||
+      typeof body.content.body !== 'string' || !body.content.body ||
+      (body.content.msgtype !== undefined && typeof body.content.msgtype !== 'string') ||
+      (body.content.admin_contact !== undefined && typeof body.content.admin_contact !== 'string')) {
     return Errors.missingParam('user_id or content.body').toResponse();
   }
 
   const eventId = await sendServerNotice(
-    db,
-    c.env.SERVER_NAME,
+    c.env,
     body.user_id,
     body.content.body,
     body.content.msgtype || 'm.text',
@@ -330,13 +248,14 @@ app.post('/_matrix/client/v3/admin/send_server_notice', requireAuth(), async (c)
     return Errors.badJson().toResponse();
   }
 
-  if (!body.user_id || !body.content?.body) {
+  if (!isObject(body) || typeof body.user_id !== 'string' || !isObject(body.content) ||
+      typeof body.content.body !== 'string' || !body.content.body ||
+      (body.content.msgtype !== undefined && typeof body.content.msgtype !== 'string')) {
     return Errors.missingParam('user_id or content.body').toResponse();
   }
 
   const eventId = await sendServerNotice(
-    db,
-    c.env.SERVER_NAME,
+    c.env,
     body.user_id,
     body.content.body,
     body.content.msgtype || 'm.text'

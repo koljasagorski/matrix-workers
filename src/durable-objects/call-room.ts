@@ -3,6 +3,8 @@
 // Uses Cloudflare Calls SFU for media routing
 
 import type { Env } from '../types';
+import { getMembership } from '../services/database';
+import { isObject } from '../services/federation-events';
 import {
   createSession,
   addTracks,
@@ -23,6 +25,16 @@ interface TrackInfo {
   mid: string;
   kind: 'audio' | 'video';
   enabled: boolean;
+}
+
+interface CallSocketAttachment {
+  userId: string;
+  deviceId: string;
+  participant?: {
+    sessionId: string;
+    tracks: [string, TrackInfo][];
+    joinedAt: number;
+  };
 }
 
 interface SignalingMessage {
@@ -128,6 +140,7 @@ export class CallRoomDurableObject implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
   private participants: Map<string, Participant> = new Map(); // oderId|deviceId -> Participant
+  private joining = new Set<string>();
   private callId: string | null = null;
   private matrixRoomId: string | null = null;
 
@@ -139,6 +152,20 @@ export class CallRoomDurableObject implements DurableObject {
     this.state.blockConcurrencyWhile(async () => {
       this.callId = await this.state.storage.get('callId') || null;
       this.matrixRoomId = await this.state.storage.get('matrixRoomId') || null;
+      for (const socket of this.state.getWebSockets()) {
+        const attachment = this.socketAttachment(socket);
+        if (!attachment) {
+          socket.close(4001, 'Please reconnect with an authenticated session');
+          continue;
+        }
+        if (attachment.participant) {
+          this.participants.set(`${attachment.userId}|${attachment.deviceId}`, {
+            oderId: attachment.userId, deviceId: attachment.deviceId,
+            sessionId: attachment.participant.sessionId, tracks: new Map(attachment.participant.tracks),
+            joinedAt: attachment.participant.joinedAt, webSocket: socket,
+          });
+        }
+      }
     });
   }
 
@@ -174,8 +201,7 @@ export class CallRoomDurableObject implements DurableObject {
     this.matrixRoomId = body.roomId;
     this.callId = body.callId;
 
-    await this.state.storage.put('matrixRoomId', this.matrixRoomId);
-    await this.state.storage.put('callId', this.callId);
+    await this.state.storage.put({ matrixRoomId: this.matrixRoomId, callId: this.callId });
 
     return Response.json({
       callId: this.callId,
@@ -186,13 +212,22 @@ export class CallRoomDurableObject implements DurableObject {
   private async handleWebSocket(request: Request): Promise<Response> {
     // Verify WebSocket upgrade
     const upgradeHeader = request.headers.get('Upgrade');
-    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+    if (upgradeHeader?.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
+    }
+
+    const userId = request.headers.get('X-Matrix-Call-User');
+    const deviceId = request.headers.get('X-Matrix-Call-Device');
+    if (!userId || !deviceId) return new Response('Authenticated call identity required', { status: 401 });
+    if (!this.callId || !this.matrixRoomId) return new Response('Call not active', { status: 404 });
+    if ((await getMembership(this.env.DB, this.matrixRoomId, userId))?.membership !== 'join') {
+      return new Response('Not a member of this room', { status: 403 });
     }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
+    server.serializeAttachment({ userId, deviceId } satisfies CallSocketAttachment);
     // Accept the WebSocket
     this.state.acceptWebSocket(server);
 
@@ -210,13 +245,30 @@ export class CallRoomDurableObject implements DurableObject {
 
     let msg: SignalingMessage;
     try {
-      msg = JSON.parse(message);
+      const parsed: unknown = JSON.parse(message);
+      if (!isObject(parsed) || typeof parsed.type !== 'string') {
+        this.sendError(ws, 'INVALID_MESSAGE', 'A signaling message object is required');
+        return;
+      }
+      msg = { ...parsed, type: parsed.type };
     } catch {
       this.sendError(ws, 'INVALID_JSON', 'Invalid JSON message');
       return;
     }
 
     try {
+      const attachment = this.socketAttachment(ws);
+      if (!attachment || !this.callId || !this.matrixRoomId) {
+        this.sendError(ws, 'UNAUTHORIZED', 'Authenticated call session required');
+        ws.close(4001, 'Call session no longer valid');
+        return;
+      }
+      if ((await getMembership(this.env.DB, this.matrixRoomId, attachment.userId))?.membership !== 'join') {
+        this.sendError(ws, 'FORBIDDEN', 'You are no longer a member of this room');
+        await this.handleLeave(ws);
+        ws.close(4003, 'Room membership required');
+        return;
+      }
       switch (msg.type) {
         case 'join':
           await this.handleJoin(ws, msg as unknown as JoinMessage);
@@ -252,60 +304,70 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleJoin(ws: WebSocket, msg: JoinMessage): Promise<void> {
-    const participantKey = `${msg.userId}|${msg.deviceId}`;
+    const attachment = this.socketAttachment(ws);
+    if (!attachment || msg.userId !== attachment.userId || msg.deviceId !== attachment.deviceId) {
+      this.sendError(ws, 'FORBIDDEN', 'Join identity does not match the authenticated session');
+      return;
+    }
+    const participantKey = `${attachment.userId}|${attachment.deviceId}`;
 
     // Check if already joined
-    if (this.participants.has(participantKey)) {
+    if (this.participants.has(participantKey) || this.joining.has(participantKey)) {
       this.sendError(ws, 'ALREADY_JOINED', 'Already joined this call');
       return;
     }
 
-    // Create a Cloudflare Calls session for this participant
-    const session = await createSession(this.env);
+    this.joining.add(participantKey);
+    try {
+      // Reserve the identity before SFU I/O so simultaneous joins cannot open
+      // two sessions for the same device.
+      const session = await createSession(this.env);
+      if (!this.callId || !this.matrixRoomId) {
+        this.sendError(ws, 'CALL_ENDED', 'Call has ended');
+        return;
+      }
 
-    const participant: Participant = {
-      oderId: msg.userId,
-      deviceId: msg.deviceId,
-      sessionId: session.sessionId,
-      tracks: new Map(),
-      webSocket: ws,
-      joinedAt: Date.now(),
-    };
+      const participant: Participant = {
+        oderId: attachment.userId,
+        deviceId: attachment.deviceId,
+        sessionId: session.sessionId,
+        tracks: new Map(),
+        webSocket: ws,
+        joinedAt: Date.now(),
+      };
 
-    this.participants.set(participantKey, participant);
+      this.participants.set(participantKey, participant);
+      this.saveParticipant(participant);
 
-    // Tag the WebSocket for later lookup
-    this.state.setWebSocketAutoResponse(
-      new WebSocketRequestResponsePair(
-        JSON.stringify({ type: 'ping' }),
-        JSON.stringify({ type: 'pong' })
-      )
-    );
+      this.state.setWebSocketAutoResponse(
+        new WebSocketRequestResponsePair(JSON.stringify({ type: 'ping' }), JSON.stringify({ type: 'pong' }))
+      );
 
-    // Send welcome message with current participants
-    const welcomeMsg: WelcomeMessage = {
-      type: 'welcome',
-      callId: this.callId || '',
-      participants: Array.from(this.participants.values())
-        .filter(p => p.oderId !== msg.userId || p.deviceId !== msg.deviceId)
-        .map(p => ({
-          oderId: p.oderId,
-          deviceId: p.deviceId,
-          tracks: Array.from(p.tracks.entries()).map(([name, info]) => ({
-            trackName: name,
-            kind: info.kind,
+      const welcomeMsg: WelcomeMessage = {
+        type: 'welcome',
+        callId: this.callId,
+        participants: Array.from(this.participants.values())
+          .filter(p => p.oderId !== attachment.userId || p.deviceId !== attachment.deviceId)
+          .map(p => ({
+            oderId: p.oderId,
+            deviceId: p.deviceId,
+            tracks: Array.from(p.tracks.entries()).map(([name, info]) => ({
+              trackName: name,
+              kind: info.kind,
+            })),
           })),
-        })),
-    };
-    this.send(ws, welcomeMsg);
+      };
+      this.send(ws, welcomeMsg);
 
-    // Notify other participants
-    const joinedMsg: ParticipantJoinedMessage = {
-      type: 'participant_joined',
-      oderId: msg.userId,
-      deviceId: msg.deviceId,
-    };
-    this.broadcast(joinedMsg, participantKey);
+      const joinedMsg: ParticipantJoinedMessage = {
+        type: 'participant_joined',
+        oderId: attachment.userId,
+        deviceId: attachment.deviceId,
+      };
+      this.broadcast(joinedMsg, participantKey);
+    } finally {
+      this.joining.delete(participantKey);
+    }
   }
 
   private async handleOffer(ws: WebSocket, msg: OfferMessage): Promise<void> {
@@ -346,6 +408,7 @@ export class CallRoomDurableObject implements DurableObject {
       kind: msg.kind,
       enabled: true,
     });
+    this.saveParticipant(participant);
 
     // Send answer back to client
     const answerMsg: OfferResponseMessage = {
@@ -402,6 +465,7 @@ export class CallRoomDurableObject implements DurableObject {
 
     // Remove participant
     this.participants.delete(participantKey);
+    ws.serializeAttachment({ userId: participant.oderId, deviceId: participant.deviceId } satisfies CallSocketAttachment);
 
     // Notify other participants
     const leftMsg: ParticipantLeftMessage = {
@@ -433,6 +497,7 @@ export class CallRoomDurableObject implements DurableObject {
     }
 
     track.enabled = !msg.muted;
+    this.saveParticipant(participant);
 
     // Notify other participants about mute state
     this.broadcast({
@@ -485,11 +550,34 @@ export class CallRoomDurableObject implements DurableObject {
     }
 
     this.participants.clear();
+    this.callId = null;
+    this.matrixRoomId = null;
 
     // Clear storage
     await this.state.storage.deleteAll();
 
     return Response.json({ success: true });
+  }
+
+  private socketAttachment(ws: WebSocket): CallSocketAttachment | null {
+    const raw: unknown = ws.deserializeAttachment();
+    if (!isObject(raw) || typeof raw.userId !== 'string' || !raw.userId ||
+        typeof raw.deviceId !== 'string' || !raw.deviceId) return null;
+    if (raw.participant !== undefined && (!isObject(raw.participant) ||
+        typeof raw.participant.sessionId !== 'string' || !Array.isArray(raw.participant.tracks) ||
+        !Number.isSafeInteger(raw.participant.joinedAt) ||
+        !raw.participant.tracks.every(track => Array.isArray(track) && track.length === 2 &&
+          typeof track[0] === 'string' && isObject(track[1]) && typeof track[1].mid === 'string' &&
+          ['audio', 'video'].includes(String(track[1].kind)) && typeof track[1].enabled === 'boolean'))) return null;
+    return { userId: raw.userId, deviceId: raw.deviceId,
+      ...(raw.participant === undefined ? {} : { participant: raw.participant as CallSocketAttachment['participant'] }) };
+  }
+
+  private saveParticipant(participant: Participant): void {
+    participant.webSocket?.serializeAttachment({
+      userId: participant.oderId, deviceId: participant.deviceId,
+      participant: { sessionId: participant.sessionId, joinedAt: participant.joinedAt, tracks: [...participant.tracks.entries()] },
+    } satisfies CallSocketAttachment);
   }
 
   private getParticipantBySocket(ws: WebSocket): Participant | null {
