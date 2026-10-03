@@ -18,6 +18,7 @@ import voip from './api/voip';
 import keys from './api/keys';
 import federation from './api/federation';
 import admin from './api/admin';
+import migrationBackup from './api/migration-backup';
 import keyBackups from './api/key-backups';
 import toDevice from './api/to-device';
 import push from './api/push';
@@ -46,6 +47,7 @@ import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth } from './middleware/auth';
 import { analyticsMiddleware } from './middleware/analytics';
 import { getSupportedRoomVersions } from './services/room-versions';
+import { migrationFreeze } from './middleware/migration-freeze';
 
 // Import Durable Objects
 export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
@@ -67,6 +69,7 @@ app.use('*', cors({
 }));
 
 // Global middleware
+app.use('*', migrationFreeze);
 app.use('*', analyticsMiddleware());
 
 // Rate limiting for Matrix API endpoints
@@ -107,6 +110,7 @@ app.get('/admin/', (c) => {
 
 // Admin API routes
 app.route('/', admin);
+app.route('/', migrationBackup);
 
 // QR code login landing page - commented out, requires MSC4108/OIDC for Element X
 // app.route('/', qrLogin);

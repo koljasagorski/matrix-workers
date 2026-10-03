@@ -46,3 +46,11 @@ test-jwt.json
 .local/
 .env.*
 .dev.vars.*
+
+# Python migration tooling
+__pycache__/
+*.py[cod]
+.venv/
+
+# Reviewed VPS maintenance scripts
+!deploy/vps/*.sh

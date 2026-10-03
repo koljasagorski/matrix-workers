@@ -4,6 +4,8 @@
 // - Cached statistics (avoid D1 queries on every request)
 // - Active admin sessions for real-time notifications
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 
@@ -53,6 +55,8 @@ export class AdminDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -236,6 +240,7 @@ export class AdminDurableObject extends DurableObject<Env> {
 
   // WebSocket message handler
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') { ws.close(1013, 'Migration maintenance'); return; }
     try {
       const data = typeof message === 'string' ? JSON.parse(message) : null;
       if (!data) return;
@@ -273,6 +278,10 @@ export class AdminDurableObject extends DurableObject<Env> {
 
   // Alarm handler for periodic stats refresh
   async alarm(): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') {
+      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      return;
+    }
     // Refresh stats cache
     this.statsCache = await this.fetchStatsFromD1();
     this.statsCacheTime = Date.now();

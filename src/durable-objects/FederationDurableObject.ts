@@ -1,5 +1,7 @@
 // Federation Durable Object for server-to-server communication
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import { sha256 } from '../utils/crypto';
 import { readFederationJson } from '../services/federation-http';
@@ -53,6 +55,8 @@ export class FederationDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -374,6 +378,10 @@ export class FederationDurableObject extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') {
+      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      return;
+    }
     const pending = [...(await this.ctx.storage.list<OutboundEvent>({ prefix:'queue:' })).values(),
       ...(await this.ctx.storage.list<OutboundEdu>({ prefix:'edu:' })).values()];
     for (const destination of new Set(pending.map(item => item.destination))) {

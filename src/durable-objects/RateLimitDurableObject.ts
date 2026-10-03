@@ -4,6 +4,8 @@
 // Each instance handles rate limiting for a specific category (login, register, etc.)
 // Counters are stored in memory and automatically cleaned up when they expire
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 
 interface RateLimitEntry {
@@ -41,6 +43,8 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
   private cleanupAlarm: number | null = null;
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     try {
       const body: RateLimitRequest = await request.json();
 
@@ -126,6 +130,10 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
   }
 
   async alarm() {
+    if (this.env.MIGRATION_FREEZE === '1') {
+      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      return;
+    }
     this.cleanupExpiredEntries();
   }
 }

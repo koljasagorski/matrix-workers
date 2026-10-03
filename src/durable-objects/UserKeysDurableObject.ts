@@ -3,6 +3,8 @@
 // This DO provides single-threaded, atomic operations for device keys and cross-signing keys
 // which is critical during the initial E2EE bootstrap flow.
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 
@@ -26,6 +28,8 @@ export class UserKeysDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 

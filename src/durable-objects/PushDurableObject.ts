@@ -1,6 +1,8 @@
 // Push Durable Object for direct APNs delivery
 // Bypasses Sygnal for full control over notification payload
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 
@@ -60,6 +62,8 @@ export class PushDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -329,6 +333,10 @@ export class PushDurableObject extends DurableObject<Env> {
 
   // Retry failed notifications
   async alarm(): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') {
+      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      return;
+    }
     const now = Date.now();
     const retryDelay = 60000; // 1 minute
 

@@ -4,6 +4,10 @@ export interface Env extends Omit<CloudflareBindings, 'SERVER_NAME' | 'SERVER_VE
   SERVER_NAME: string;
   SERVER_VERSION: string;
 
+  // Temporary, operator-approved existing DO IDs for password-confirmed backup.
+  MIGRATION_EXPORT_OBJECTS?: string;
+  MIGRATION_FREEZE?: string;
+
   // Support contact info (optional)
   ADMIN_CONTACT_EMAIL?: string;
   ADMIN_CONTACT_MXID?: string;

@@ -1,6 +1,8 @@
 // Sync Durable Object for user-specific sync state
 // Handles both WebSocket-based traditional sync and HTTP-based sliding sync
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 
@@ -48,6 +50,8 @@ export class SyncDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -323,6 +327,7 @@ export class SyncDurableObject extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') { ws.close(1013, 'Migration maintenance'); return; }
     const session = ws.deserializeAttachment() as SyncSession | null;
     if (!session) return;
 
@@ -367,6 +372,10 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   // Cleanup old events (run periodically via alarm)
   async alarm(): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') {
+      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      return;
+    }
     const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
 
     const allKeys = await this.ctx.storage.list({ prefix: 'event:' });

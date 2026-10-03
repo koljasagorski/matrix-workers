@@ -1,5 +1,7 @@
 // Room Durable Object for real-time room coordination
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 import { notifyReceiptUsers, parseFederatedReceipts, queueReadReceipt, receiptAdvances, receiptEventDepths, recordReadReceipts, type ReadReceipt } from '../services/read-receipts';
@@ -98,6 +100,8 @@ export class RoomDurableObject extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.ctx);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -416,6 +420,7 @@ export class RoomDurableObject extends DurableObject<Env> {
 
   // WebSocket hibernation handlers
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') { ws.close(1013, 'Migration maintenance'); return; }
     const session = ws.deserializeAttachment() as RoomSession | null;
     if (!session) return;
 

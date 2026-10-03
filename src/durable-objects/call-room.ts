@@ -2,6 +2,8 @@
 // Manages WebRTC signaling for video/audio calls in a Matrix room
 // Uses Cloudflare Calls SFU for media routing
 
+import { migrationExport } from './migration-export';
+import { frozenResponse } from '../middleware/migration-freeze';
 import type { Env } from '../types';
 import { getMembership } from '../services/database';
 import { isObject } from '../services/federation-events';
@@ -170,6 +172,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === '/migration-export') return migrationExport(request, this.state);
+    if (this.env.MIGRATION_FREEZE === '1') return frozenResponse();
     const url = new URL(request.url);
 
     // Initialize call room
@@ -238,6 +242,7 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.env.MIGRATION_FREEZE === '1') { ws.close(1013, 'Migration maintenance'); return; }
     if (typeof message !== 'string') {
       this.sendError(ws, 'INVALID_MESSAGE', 'Binary messages not supported');
       return;
