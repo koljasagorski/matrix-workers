@@ -233,3 +233,27 @@ it.each(paths)('keeps left tombstoned rooms outside active sliding lists at %s',
   const response = await sliding(path, { lists: { old: { range: [0, 20], filters: { is_tombstoned: true } } } });
   expect(response.lists.old.count).toBe(0); expect(response.rooms[old]).toBeUndefined();
 });
+
+it.each(paths)('restores the original room to non-tombstoned lists after a genuine tombstone redaction at %s', async path => {
+  const old = await create('token', { room_version: '10' }); const current = await create('token', { room_version: '10' });
+  const tombstone = await sendLocalRoomEvent(ctx.env, { roomId: old, sender: alice, type: 'm.room.tombstone', stateKey: '',
+    content: { body: 'Replaced', replacement_room: current } });
+  const body = { conn_id: 'restored-old-room', lists: {
+    active: { range: [0, 20], filters: { is_tombstoned: false } },
+    replaced: { range: [0, 20], filters: { is_tombstoned: true } },
+  } };
+  const before = await sliding(path, body);
+  expect(before.lists.active.ops[0].room_ids).toEqual([current]);
+  expect(before.lists.replaced.ops[0].room_ids).toEqual([old]);
+  const redacted = await rooms.request(`/_matrix/client/v3/rooms/${encodeURIComponent(old)}/redact/${encodeURIComponent(tombstone.event_id)}/restore`,
+    { method: 'PUT', headers, body: '{}' }, ctx.env);
+  expect(redacted.status).toBe(200);
+  const stored = ctx.sqlite.prepare('SELECT content FROM events WHERE event_id=?').get(tombstone.event_id) as { content: string };
+  expect(JSON.parse(stored.content)).toEqual({});
+  const after = await sliding(path, body, before.pos);
+  expect(after.lists.active.count).toBe(2);
+  expect(after.lists.active.ops[0].room_ids).toEqual(expect.arrayContaining([old, current]));
+  expect(after.lists.replaced.count).toBe(0);
+  expect(after.rooms[old].membership).toBe('join');
+  expect((ctx.sqlite.prepare('SELECT membership FROM room_memberships WHERE room_id=? AND user_id=?').get(current, alice) as any).membership).toBe('join');
+});

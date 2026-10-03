@@ -285,6 +285,55 @@ describe('authorized signed local room events', () => {
 });
 
 describe('remote membership handshakes', () => {
+  it.each(['10', '11', '12'].flatMap(version => ['kick', 'ban'].flatMap(action =>
+    (version === '12' ? [false] : [false, true]).map(equalPower => ({ version, action, equalPower })))))
+    ('authorizes and targets v$version $action invite cancellations (equal power: $equalPower)', async ({ version, action, equalPower }) => {
+    const roomId = await create(version);
+    const keys = new Map<string, Awaited<ReturnType<typeof generateSigningKeyPair>>>();
+    for (const server of ['remote.example', 'other.example']) {
+      const key = await generateSigningKeyPair(); keys.set(server, key);
+      await ctx.env.CACHE.put(`discovery:${server}`, JSON.stringify({ host: server, port: 443, tlsHostname: server }));
+      ctx.sqlite.prepare(`INSERT INTO remote_server_keys(server_name,key_id,public_key,valid_from,valid_until,fetched_at,verified)
+        VALUES(?,?,?,?,?,?,1)`).run(server, key.keyId, key.publicKey, Date.now() - 1000, Date.now() + 86400000, Date.now());
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input)); const key = keys.get(url.hostname)!;
+      expect(url.pathname).toContain('/_matrix/federation/v2/invite/');
+      const body = JSON.parse(String(init?.body)) as { event: WireEvent };
+      const signed = await signJson({ ...peerSigningEvent(body.event, version), signatures: body.event.signatures },
+        url.hostname, key.keyId, key.privateKeyJwk);
+      return Response.json({ event: { ...body.event, signatures: signed.signatures } });
+    }));
+    const target = '@guest:remote.example'; const unrelated = '@guest:other.example';
+    for (const user_id of [target, unrelated]) {
+      expect((await request(roomPath(roomId, 'invite'), 'POST', { user_id })).status).toBe(200);
+    }
+    queued = [];
+    expect((await request(roomPath(roomId, 'state/m.room.name'), 'PUT', { name: 'Private room state' })).status).toBe(200);
+    expect(queued).toEqual([]);
+    if (equalPower) {
+      const power = (await getRoomState(ctx.env.DB, roomId)).find(event => event.type === 'm.room.power_levels')!;
+      expect((await request(roomPath(roomId, 'state/m.room.power_levels'), 'PUT', {
+        ...power.content, users: { ...power.content.users as object, [target]: 100 },
+      })).status).toBe(200);
+    }
+    const response = await request(roomPath(roomId, action), 'POST', { user_id: target, reason: 'Cancel invitation' });
+    if (equalPower) {
+      expect(response.status).toBe(403);
+      expect(queued).toEqual([]);
+      expect(ctx.sqlite.prepare('SELECT membership FROM room_memberships WHERE room_id=? AND user_id=?').get(roomId, target))
+        .toEqual({ membership: 'invite' });
+      return;
+    }
+    expect(response.status).toBe(200);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ destination: 'remote.example', pdu: { type: 'm.room.member', state_key: target,
+      content: { membership: action === 'kick' ? 'leave' : 'ban', reason: 'Cancel invitation' } } });
+    assertSigned((await getEvent(ctx.env.DB, queued[0].event_id))!, version);
+    expect(ctx.sqlite.prepare('SELECT membership FROM room_memberships WHERE room_id=? AND user_id=?').get(roomId, unrelated))
+      .toEqual({ membership: 'invite' });
+  });
+
   it('gets and verifies a remote invitation countersignature before storing success', async () => {
     const roomId = await create();
     const remote = 'remote.example'; const key = await generateSigningKeyPair();

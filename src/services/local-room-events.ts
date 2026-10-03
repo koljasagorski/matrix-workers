@@ -139,10 +139,13 @@ export async function countersignLocalRoomInvite(env: Env, event: PDU, version: 
 
 export async function persistLocalRoomEvent(env: Env, event: PDU, version: string): Promise<void> {
   // Capture destinations before a kick/ban/leave removes the last resident on a
-  // remote server, otherwise that server never receives its user's departure.
+  // remote server. A cancelled invite must also reach its particular recipient,
+  // without exposing other room events to servers of unjoined invitees.
+  const cancelledInvitee = ['leave', 'ban'].includes(String(event.content.membership)) ? event.state_key ?? '' : '';
   const previousMembers = event.type === 'm.room.member'
-    ? await env.DB.prepare("SELECT user_id FROM room_memberships WHERE room_id=? AND membership='join'")
-      .bind(event.room_id).all<{ user_id: string }>() : null;
+    ? await env.DB.prepare(`SELECT user_id FROM room_memberships WHERE room_id=?
+        AND (membership='join' OR (membership='invite' AND user_id=?))`)
+      .bind(event.room_id, cancelledInvitee).all<{ user_id: string }>() : null;
   const membership = event.type === 'm.room.member' ? [env.DB.prepare(`INSERT OR REPLACE INTO room_memberships
     (room_id,user_id,membership,event_id,display_name,avatar_url) VALUES (?,?,?,?,?,?)`)
     .bind(event.room_id, event.state_key!, String(event.content.membership), event.event_id,

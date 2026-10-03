@@ -348,7 +348,14 @@ async function getUserRooms(
     query += isInvited ? ` AND rm.membership = 'invite'` : ` AND rm.membership = 'join'`;
   }
   if (filters?.is_tombstoned !== undefined) {
-    query += ` AND ${filters.is_tombstoned ? '' : 'NOT '}EXISTS (SELECT 1 FROM room_state rs WHERE rs.room_id = rm.room_id AND rs.event_type = 'm.room.tombstone' AND rs.state_key = '')`;
+    // Redacting a tombstone retains its state key but removes its replacement
+    // target. Only a current, nonempty string target marks a replaced room.
+    query += ` AND ${filters.is_tombstoned ? '' : 'NOT '}EXISTS (
+      SELECT 1 FROM room_state rs JOIN events e ON e.event_id=rs.event_id AND e.room_id=rs.room_id
+      WHERE rs.room_id=rm.room_id AND rs.event_type='m.room.tombstone' AND rs.state_key=''
+        AND json_type(e.content, '$.replacement_room')='text'
+        AND length(trim(json_extract(e.content, '$.replacement_room')))>0
+    )`;
   }
 
   // Default sort: by recency

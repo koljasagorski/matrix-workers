@@ -43,6 +43,13 @@ async function renew(env: Env, job: UpgradeJob, token: string): Promise<void> {
   await env.DB.batch([guard(env, job.old_room_id, token)]);
 }
 
+async function isRedactedTombstone(env: Env, event: PDU, version: string): Promise<boolean> {
+  if (event.content.replacement_room !== undefined) return false;
+  return !!await env.DB.prepare(`SELECT event_id FROM events WHERE room_id=? AND event_type='m.room.redaction'
+    AND ${version === '10' ? 'redacts' : "json_extract(content,'$.redacts')"}=? LIMIT 1`)
+    .bind(event.room_id, event.event_id).first();
+}
+
 async function publish(env: Env, event: PDU, version: string): Promise<void> {
   await queueRoomEvent(env, event, version);
   await notifyUsersOfEvent(env, event.room_id, event.event_id, event.type);
@@ -145,7 +152,7 @@ export async function upgradeRoom(env: Env, options: UpgradeOptions): Promise<st
   let job = await env.DB.prepare('SELECT * FROM room_upgrades WHERE old_room_id=?').bind(options.oldRoomId).first<UpgradeJob>();
   if (!job) {
     const tombstone = state.find(event => event.type === 'm.room.tombstone');
-    if (tombstone) {
+    if (tombstone && !await isRedactedTombstone(env, tombstone, oldRoom.room_version)) {
       const replacement = typeof tombstone.content.replacement_room === 'string' ? await getRoom(env.DB, tombstone.content.replacement_room) : null;
       const create = replacement ? await getStateEvent(env.DB, replacement.room_id, 'm.room.create') : null;
       if (!replacement || !isObject(create?.content.predecessor) || create.content.predecessor.room_id !== options.oldRoomId) {
@@ -252,7 +259,9 @@ export async function upgradeRoom(env: Env, options: UpgradeOptions): Promise<st
     }
     if (job.phase === 'members_done') {
       const current = await getStateEvent(env.DB, options.oldRoomId, 'm.room.tombstone');
-      if (current && current.event_id !== plan.tombstone.event_id) throw Errors.invalidRoomState('Room received another tombstone during upgrade');
+      if (current && current.event_id !== plan.tombstone.event_id && !await isRedactedTombstone(env, current, oldRoom.room_version)) {
+        throw Errors.invalidRoomState('Room received another tombstone during upgrade');
+      }
       await env.DB.batch([guard(env, options.oldRoomId, token),
         ...await prepareStoreEventStatements(env.DB, plan.tombstone), phase(env, options.oldRoomId, 'tombstoned')]);
       job.phase = 'tombstoned';

@@ -17,8 +17,8 @@ let ctx: Awaited<ReturnType<typeof testEnv>>;
 let queued: { event_id: string; destination: string; pdu: WireEvent }[];
 const path = (id: string, suffix = 'upgrade') => `/_matrix/client/v3/rooms/${encodeURIComponent(id)}/${suffix}`;
 const mounted = new Hono<AppEnv>().route('/', rooms);
-async function request(url: string, body: unknown, token = 'token') {
-  return mounted.request(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+async function request(url: string, body: unknown, token = 'token', method = 'POST') {
+  return mounted.request(url, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body) }, ctx.env, { waitUntil: () => {}, passThroughOnException: () => {} } as ExecutionContext);
 }
 const upgrade = (id: string, version = '12', options: Record<string, unknown> = {}, token = 'token') =>
@@ -208,6 +208,42 @@ describe('resumable signed room upgrades', () => {
     expect(job(old)).toBeUndefined();
     expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get()).toEqual({ n: 2 });
     expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM events').get()).toEqual(before);
+  });
+
+  it.each(['10', '11', '12'])('allows a new upgrade after a stored matching v%s redaction removes the old tombstone', async version => {
+    const old = await create({ room_version: version, preset: 'public_chat' });
+    const tombstone = await sendLocalRoomEvent(ctx.env, { roomId: old, sender: alice, type: 'm.room.tombstone', stateKey: '',
+      content: { body: 'Accidental upgrade', replacement_room: '!abandoned:local.example' } });
+    const redaction = await request(path(old, `redact/${encodeURIComponent(tombstone.event_id)}/undo-upgrade`), {}, 'token', 'PUT');
+    expect(redaction.status).toBe(200);
+    expect((await getEvent(ctx.env.DB, tombstone.event_id))?.content).toEqual({});
+    const targetVersion = version === '12' ? '11' : '12';
+    await registerBob();
+    expect((await request(path(old, 'join'), {}, 'bob-token')).status).toBe(200);
+    expect((await upgrade(old, targetVersion, {}, 'bob-token')).status).toBe(403);
+    expect(job(old)).toBeUndefined();
+    const next = await replacement(await upgrade(old, targetVersion));
+    await assertGraph(next, targetVersion);
+    expect((await getRoomState(ctx.env.DB, old)).find(event => event.type === 'm.room.tombstone')?.content.replacement_room).toBe(next);
+  });
+
+  it.each(['missing', 'wrong target', 'wrong room'])('does not trust a fake redacted tombstone annotation with %s redaction evidence', async evidence => {
+    const old = await create();
+    const tombstone = await sendLocalRoomEvent(ctx.env, { roomId: old, sender: alice, type: 'm.room.tombstone', stateKey: '',
+      content: { body: 'Invalid replacement', replacement_room: '!missing:local.example' } });
+    let redactionId = '$missing-redaction';
+    if (evidence !== 'missing') {
+      const redactionRoom = evidence === 'wrong room' ? await create() : old;
+      const event = await sendLocalRoomEvent(ctx.env, { roomId: redactionRoom, sender: alice, type: 'm.room.redaction',
+        content: {}, redacts: evidence === 'wrong room' ? tombstone.event_id : '$unrelated-event' });
+      redactionId = event.event_id;
+    }
+    ctx.sqlite.prepare('UPDATE events SET content=?,unsigned=? WHERE event_id=?').run('{}',
+      JSON.stringify({ redacted_because: { type: 'm.room.redaction', event_id: redactionId } }), tombstone.event_id);
+    const before = ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get();
+    expect((await upgrade(old)).status).toBe(400);
+    expect(job(old)).toBeUndefined();
+    expect(ctx.sqlite.prepare('SELECT count(*) AS n FROM rooms').get()).toEqual(before);
   });
 
   it('invites other local members through authorized events and preserves bans without forging their joins', async () => {
