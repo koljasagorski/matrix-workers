@@ -1,6 +1,9 @@
 // Federation Durable Object for server-to-server communication
 
 import { DurableObject } from 'cloudflare:workers';
+import { sha256 } from '../utils/crypto';
+import { readFederationJson } from '../services/federation-http';
+import { federationPut } from '../services/federation-keys';
 import type { Env } from '../types';
 
 interface FederationTarget {
@@ -80,8 +83,8 @@ export class FederationDurableObject extends DurableObject<Env> {
     const key = `queue:${data.destination}:${data.event_id}`;
     await this.ctx.storage.put(key, outboundEvent);
 
-    // Try to send immediately
-    await this.processFederationQueue(data.destination);
+    // Persist before responding; delivery survives the originating HTTP request.
+    await this.ctx.storage.setAlarm(Date.now() + 1);
 
     return new Response('Queued');
   }
@@ -229,8 +232,8 @@ export class FederationDurableObject extends DurableObject<Env> {
     const key = `edu:${data.destination}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     await this.ctx.storage.put(key, edu);
 
-    // Try to send immediately
-    await this.processFederationQueue(data.destination);
+    // Persist before responding; delivery survives the originating HTTP request.
+    await this.ctx.storage.setAlarm(Date.now() + 1);
 
     return new Response('Queued');
   }
@@ -268,26 +271,24 @@ export class FederationDurableObject extends DurableObject<Env> {
     }));
 
     try {
-      const response = await fetch(`https://${destination}/_matrix/federation/v1/send/${Date.now()}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          pdus,
-          edus: eduPayloads,
-        }),
-      });
+      const response = await federationPut(destination,
+        `/_matrix/federation/v1/send/${await sha256(JSON.stringify([events.slice(0,50).map(e=>e.event_id),eduKeyNames.slice(0,100)]))}`,
+        { origin: this.env.SERVER_NAME, origin_server_ts: events[0]?.created_at ?? edus[0].created_at, pdus: pdus.slice(0, 50), edus: eduPayloads.slice(0, 100) },
+        this.env.SERVER_NAME, this.env.DB, this.env.CACHE);
 
       if (response.ok) {
+        const result = await readFederationJson(response) as { pdus?: Record<string, {error?: string}> };
+        if (Object.values(result.pdus ?? {}).some(pdu => pdu.error)) throw new Error('Remote server rejected federation event');
         // Remove sent events from queue
-        for (const event of events) {
+        for (const event of events.slice(0, 50)) {
           await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
         }
         // Remove sent EDUs
-        for (const key of eduKeyNames) {
+        for (const key of eduKeyNames.slice(0, 100)) {
           await this.ctx.storage.delete(key);
         }
+
+        if (events.length > 50 || edus.length > 100) await this.ctx.storage.setAlarm(Date.now() + 1000);
 
         // Update server status
         const target: FederationTarget = {
@@ -335,14 +336,17 @@ export class FederationDurableObject extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    // Process all destinations with pending retries
-    const allKeys = await this.ctx.storage.list({ prefix: 'server:' });
-
-    for (const [, value] of allKeys) {
-      const target = value as FederationTarget;
-      if (target.nextRetry && target.nextRetry <= Date.now()) {
-        await this.processFederationQueue(target.serverName);
-      }
+    const pending = [...(await this.ctx.storage.list<OutboundEvent>({ prefix:'queue:' })).values(),
+      ...(await this.ctx.storage.list<OutboundEdu>({ prefix:'edu:' })).values()];
+    let next: number | undefined;
+    for (const destination of new Set(pending.map(item => item.destination))) {
+      const target = await this.ctx.storage.get<FederationTarget>(`server:${destination}`);
+      if (!target?.nextRetry || target.nextRetry <= Date.now()) await this.processFederationQueue(destination);
+      else next = Math.min(next ?? Infinity, target.nextRetry);
+    }
+    if (next) {
+      const current = await this.ctx.storage.getAlarm();
+      if (!current || next < current) await this.ctx.storage.setAlarm(next);
     }
   }
 }

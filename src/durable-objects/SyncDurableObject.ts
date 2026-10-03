@@ -58,6 +58,10 @@ export class SyncDurableObject extends DurableObject<Env> {
     if (path === '/notify') {
       return this.handleNotify(request);
     }
+    if (path === '/notify-device' && request.method === 'POST') {
+      for (const resolve of this.waitingResolvers.splice(0)) resolve(true);
+      return Response.json({ success: true });
+    }
 
     if (path === '/pending') {
       return this.handlePending(request);
@@ -126,11 +130,9 @@ export class SyncDurableObject extends DurableObject<Env> {
       const state = await request.json() as SlidingSyncConnectionState;
       const key = `sliding_sync:${connId}`;
 
-      // Update in-memory cache
-      this.slidingSyncStates.set(key, state);
-
       // Persist to storage (DO storage has no rate limits like KV)
       await this.ctx.storage.put(key, state);
+      this.slidingSyncStates.set(key, state);
 
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json' },
@@ -232,13 +234,13 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   // Wait for events (used by long-polling sliding sync)
   private async handleWaitForEvents(request: Request): Promise<Response> {
+    let myResolver: ((hasEvents: boolean) => void) | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const body = await request.json() as { timeout?: number };
+      const body = await request.json() as { timeout?: number; userId?: string; deviceId?: string; toDeviceSince?: string };
       const timeout = Math.min(body.timeout || 25000, 25000); // Cap at 25s
 
       console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.length);
-
-      let myResolver: ((hasEvents: boolean) => void) | null = null;
 
       // Create a promise that resolves when events arrive or timeout expires
       const eventPromise = new Promise<boolean>((resolve) => {
@@ -246,20 +248,22 @@ export class SyncDurableObject extends DurableObject<Env> {
         this.waitingResolvers.push(resolve);
       });
 
+      // Register first, then check the queue: this closes the gap between a
+      // Worker's empty read and its request reaching this object.
+      if (body.userId && body.deviceId && /^\d+$/.test(body.toDeviceSince ?? '0')) {
+        const queued = await this.env.DB.prepare(`SELECT 1 FROM to_device_messages WHERE recipient_user_id=?
+          AND recipient_device_id=? AND delivered=0 AND stream_position>? LIMIT 1`)
+          .bind(body.userId, body.deviceId, Number(body.toDeviceSince ?? '0')).first();
+        if (queued && myResolver) (myResolver as (ready: boolean) => void)(true);
+      }
+
       const timeoutPromise = new Promise<boolean>((resolve) => {
-        setTimeout(() => resolve(false), timeout);
+        timer = setTimeout(() => resolve(false), timeout);
       });
 
       // Wait for either events or timeout
       const hasEvents = await Promise.race([eventPromise, timeoutPromise]);
-
-      // Clean up our resolver from the array if timeout won
-      if (!hasEvents && myResolver) {
-        const index = this.waitingResolvers.indexOf(myResolver);
-        if (index !== -1) {
-          this.waitingResolvers.splice(index, 1);
-        }
-      }
+      clearTimeout(timer);
 
       console.log('[SyncDO] /wait-for-events completed, hasEvents:', hasEvents);
 
@@ -272,6 +276,12 @@ export class SyncDurableObject extends DurableObject<Env> {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
       });
+    } finally {
+      clearTimeout(timer);
+      if (myResolver) {
+        const index = this.waitingResolvers.indexOf(myResolver);
+        if (index !== -1) this.waitingResolvers.splice(index, 1);
+      }
     }
   }
 

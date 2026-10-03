@@ -18,7 +18,17 @@ https://m.sgr.ski
 
 Accounts have IDs such as `@alice:m.sgr.ski`. Public and guest registration are disabled by default. An administrator creates accounts in the admin dashboard. The root URL redirects to that dashboard; this repository does not bundle a chat client.
 
+Classic login and registration issue non-expiring access tokens unless the client explicitly requests refresh support with `refresh_token: true`. This keeps Element Desktop's password-login sessions valid until logout, device removal or account deactivation. Clients that opt in receive one-hour access tokens and rotating refresh tokens valid for seven days. Previously issued tokens retain their original expiry; sign in again after deploying this change to create a persistent desktop session.
+
 The server publishes client and federation discovery at `/.well-known/matrix/client` and `/.well-known/matrix/server`. Federation uses HTTPS on port 443.
+
+Remote room aliases, room previews and joins support room versions 10–12, including version 12 room IDs without a server name. Use a room alias or supply `via` / `server_name` hints for an unknown room ID. Joins sign the federation handshake, validate event signatures and authorization dependencies, and import the room state in a D1 transaction before returning success. Accepted handshakes are temporarily cached for retry if importing fails. Historical signing keys can be retrieved from the trusted `matrix.org` key notary when an origin is offline or has retired a key.
+
+Device key queries, one-time key claims, encrypted room events and to-device messages are routed to remote homeservers. Outbound federation uses the Durable Object queue with signed requests and retries.
+
+Backward `/messages` pagination fetches remote history on demand, in pages of up to 20 historical events. It validates signatures, authorization chains and visibility at the time of each event. User-scoped history cursors and event caches expire after seven days; historical events never overwrite live state or generate notifications. Element X and classic clients receive an initial page of up to 10 remote history events when their local timeline is incomplete, plus a cursor for further pagination. Retrieving encrypted history does not supply its decryption keys: those must be shared by clients or imported from the previous account. Full Matrix conformance remains outside this tested repair.
+
+Device verification uses separate room, device-message and key-change cursors. Pending direct messages wake long polls immediately, and clients receive persisted verification signatures when querying device and cross-signing keys. Account deactivation and single/bulk device removal require the authenticated account’s current password; missing passwords and unsupported authentication methods are rejected before any mutation. Device removal clears the Durable Object/KV key stores and revokes that device’s tokens.
 
 ## What is included
 
@@ -100,7 +110,9 @@ flowchart LR
 
 The October 2026 refresh updates Hono, Wrangler, TypeScript and Vitest, removes unused UUID packages, and replaces manually duplicated platform types with generated types. It also closes a passwordless login path, enforces the admin registration setting, checks token expiration/deactivated users, rejects refresh after logout, removes authentication-token debug logging and repairs the event search index.
 
-The test suite covers these changes; it is not a full Matrix conformance suite. Upstream contains experimental and incomplete endpoints, so broader federation, OIDC and client interoperability should be validated before expanding usage.
+The federation repair also requires authentication on v2 federation endpoints, checks room access before returning private state, removes password logging from key uploads, rejects placeholder SSO/token reauthentication, enforces OAuth access-token expiry and session-bound refresh rotation, rejects unsigned JWT introspection, sandboxes uploaded media, and rate-limits browser login routes. Password-based key replacement remains available; the unimplemented SSO reset shortcuts return an explicit error.
+
+The regression tests cover alias discovery, room previews, signed joins for versions 10–12, invalid signatures/templates, atomic imports, incoming/outgoing encrypted events, remote device keys, to-device delivery, queue retries and the reproduced security issues. The test suite covers these changes; it is not a full Matrix conformance suite. Upstream contains experimental and incomplete endpoints, so broader federation, OIDC and client interoperability should be validated before expanding usage.
 
 ## License
 

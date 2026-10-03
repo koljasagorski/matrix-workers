@@ -1,6 +1,7 @@
 // Matrix Homeserver on Cloudflare Workers
 // Main entry point
 
+import { MatrixApiError } from './utils/errors';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import type { AppEnv } from './types';
@@ -69,6 +70,7 @@ app.use('*', analyticsMiddleware());
 
 // Rate limiting for Matrix API endpoints
 app.use('/_matrix/*', rateLimitMiddleware);
+app.use('/oauth/*', rateLimitMiddleware);
 
 // Direct browser visits lead to the existing admin interface.
 app.get('/', (c) => c.redirect('/admin'));
@@ -419,6 +421,7 @@ app.notFound((c) => {
 
 // Error handler
 app.onError((err, c) => {
+  if (err instanceof MatrixApiError) return err.toResponse();
   console.error('Unhandled error:', err);
   return c.json({
     errcode: 'M_UNKNOWN',

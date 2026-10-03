@@ -16,8 +16,11 @@ import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
-import { generateOpaqueId } from '../utils/ids';
+import { queryRemoteKeys } from '../services/remote-keys';
+import { parseUserId, generateOpaqueId } from '../utils/ids';
 import { getPasswordHash } from '../services/database';
+import { parseSyncPosition, changedDeviceUsers } from '../services/sync-positions';
+import { wakeDeviceSync } from '../services/device-messages';
 
 const app = new Hono<AppEnv>();
 
@@ -103,25 +106,14 @@ async function putDeviceKeysToDO(env: Env, userId: string, deviceId: string, key
 // Helper Functions
 // ============================================
 
-async function getNextStreamPosition(db: D1Database, streamName: string): Promise<number> {
-  await db.prepare(`
-    UPDATE stream_positions SET position = position + 1 WHERE stream_name = ?
-  `).bind(streamName).run();
-
-  const result = await db.prepare(`
-    SELECT position FROM stream_positions WHERE stream_name = ?
-  `).bind(streamName).first<{ position: number }>();
-
-  return result?.position || 1;
-}
-
-async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
-  const streamPosition = await getNextStreamPosition(db, 'device_keys');
-
-  await db.prepare(`
-    INSERT INTO device_key_changes (user_id, device_id, change_type, stream_position)
-    VALUES (?, ?, ?, ?)
-  `).bind(userId, deviceId, changeType, streamPosition).run();
+async function recordKeyChange(env: Env, userId: string, deviceId: string | null, changeType: string): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO stream_positions(stream_name,position) VALUES ('device_keys',1)
+      ON CONFLICT(stream_name) DO UPDATE SET position=position+1`),
+    env.DB.prepare(`INSERT INTO device_key_changes(user_id,device_id,change_type,stream_position)
+      SELECT ?,?,?,position FROM stream_positions WHERE stream_name='device_keys'`).bind(userId,deviceId,changeType),
+  ]);
+  await wakeDeviceSync(env, userId);
 }
 
 // ============================================
@@ -174,7 +166,7 @@ app.post('/_matrix/client/v3/keys/upload', requireAuth(), async (c) => {
     );
 
     // Record key change for /keys/changes
-    await recordKeyChange(db, userId, deviceId, 'update');
+    await recordKeyChange(c.env, userId, deviceId, 'update');
 
     // Queue outbound m.device_list_update EDUs to federated servers
     try {
@@ -312,7 +304,7 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
   const failures: Record<string, any> = {};
 
   // Helper function to merge signatures from DB into device keys
-  async function mergeSignaturesForDevice(userId: string, deviceId: string, deviceKey: any): Promise<any> {
+  async function mergeSignaturesForKey(userId: string, deviceId: string, deviceKey: any): Promise<any> {
     // Get any additional signatures from the database
     const dbSignatures = await db.prepare(`
       SELECT signer_user_id, signer_key_id, signature
@@ -337,6 +329,7 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
 
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      if (parseUserId(userId)?.serverName !== c.env.SERVER_NAME) continue;
       deviceKeys[userId] = {};
 
       // Get device keys from Durable Object (strongly consistent)
@@ -349,7 +342,7 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
         for (const [deviceId, keys] of Object.entries(allDeviceKeys)) {
           if (keys) {
             // Merge any DB signatures into the device keys
-            deviceKeys[userId][deviceId] = await mergeSignaturesForDevice(userId, deviceId, keys);
+            deviceKeys[userId][deviceId] = await mergeSignaturesForKey(userId, deviceId, keys);
           }
         }
       } else {
@@ -358,7 +351,7 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
           const keys = await getDeviceKeysFromDO(c.env, userId, deviceId);
           if (keys) {
             // Merge any DB signatures into the device keys
-            deviceKeys[userId][deviceId] = await mergeSignaturesForDevice(userId, deviceId, keys);
+            deviceKeys[userId][deviceId] = await mergeSignaturesForKey(userId, deviceId, keys);
           }
         }
       }
@@ -372,17 +365,23 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
       const csKeys = await getCrossSigningKeysFromDO(c.env, userId);
 
       if (csKeys.master) {
-        masterKeys[userId] = csKeys.master;
+        masterKeys[userId] = await mergeSignaturesForKey(userId, Object.values(csKeys.master.keys)[0] as string, csKeys.master);
       }
       if (csKeys.self_signing) {
-        selfSigningKeys[userId] = csKeys.self_signing;
+        selfSigningKeys[userId] = await mergeSignaturesForKey(userId, Object.values(csKeys.self_signing.keys)[0] as string, csKeys.self_signing);
       }
       // Only return user_signing key if querying own keys
       if (csKeys.user_signing && userId === requestingUserId) {
-        userSigningKeys[userId] = csKeys.user_signing;
+        userSigningKeys[userId] = await mergeSignaturesForKey(userId, Object.values(csKeys.user_signing.keys)[0] as string, csKeys.user_signing);
       }
     }
   }
+
+  const remote = await queryRemoteKeys(c.env, requestedKeys ?? {}, false, body.timeout);
+  Object.assign(deviceKeys, remote.device_keys);
+  Object.assign(masterKeys, remote.master_keys);
+  Object.assign(selfSigningKeys, remote.self_signing_keys);
+  Object.assign(failures, remote.failures);
 
   return c.json({
     device_keys: deviceKeys,
@@ -411,6 +410,7 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
 
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      if (parseUserId(userId)?.serverName !== c.env.SERVER_NAME) continue;
       oneTimeKeys[userId] = {};
 
       for (const [deviceId, algorithm] of Object.entries(devices as Record<string, string>)) {
@@ -504,6 +504,10 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
     }
   }
 
+  const remote = await queryRemoteKeys(c.env, requestedKeys ?? {}, true, body.timeout);
+  Object.assign(oneTimeKeys, remote.one_time_keys);
+  Object.assign(failures, remote.failures);
+
   return c.json({
     one_time_keys: oneTimeKeys,
     failures,
@@ -521,41 +525,8 @@ app.get('/_matrix/client/v3/keys/changes', requireAuth(), async (c) => {
     return Errors.missingParam('from and to required').toResponse();
   }
 
-  const fromPosition = parseInt(from, 10) || 0;
-  const toPosition = parseInt(to, 10) || Number.MAX_SAFE_INTEGER;
-
-  // Get users whose keys changed in this range
-  // Only return users that share rooms with the requesting user
-  const changes = await db.prepare(`
-    SELECT DISTINCT dkc.user_id, dkc.change_type
-    FROM device_key_changes dkc
-    WHERE dkc.stream_position > ? AND dkc.stream_position <= ?
-      AND dkc.user_id IN (
-        SELECT DISTINCT rm2.user_id
-        FROM room_memberships rm1
-        JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-        WHERE rm1.user_id = ? AND rm1.membership = 'join' AND rm2.membership = 'join'
-      )
-  `).bind(fromPosition, toPosition, userId).all<{
-    user_id: string;
-    change_type: string;
-  }>();
-
-  const changed: string[] = [];
-  const left: string[] = [];
-
-  for (const change of changes.results) {
-    if (change.change_type === 'delete') {
-      left.push(change.user_id);
-    } else {
-      changed.push(change.user_id);
-    }
-  }
-
-  return c.json({
-    changed: [...new Set(changed)],
-    left: [...new Set(left)],
-  });
+  const changed = await changedDeviceUsers(db, userId, parseSyncPosition(from).keys, parseSyncPosition(to).keys);
+  return c.json({ changed, left: [] });
 });
 
 // ============================================
@@ -597,13 +568,6 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
   }
 
   const { master_key, self_signing_key, user_signing_key, auth } = body;
-
-  // Debug logging for cross-signing key uploads
-  console.log('[keys] Cross-signing upload for user:', userId);
-  console.log('[keys] Auth provided:', auth ? JSON.stringify(auth) : 'none');
-  if (master_key) console.log('[keys] Master key:', JSON.stringify(master_key));
-  if (self_signing_key) console.log('[keys] Self-signing key:', JSON.stringify(self_signing_key));
-  if (user_signing_key) console.log('[keys] User-signing key:', JSON.stringify(user_signing_key));
 
   // Check if user already has cross-signing keys set up
   const existingKeys = await db.prepare(`
@@ -837,7 +801,7 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
         key_id = excluded.key_id,
         key_data = excluded.key_data
     `).bind(userId, keyId, JSON.stringify(master_key)).run();
-    await recordKeyChange(db, userId, null, 'update');
+    await recordKeyChange(c.env, userId, null, 'update');
   }
 
   if (self_signing_key) {
@@ -885,7 +849,6 @@ app.post('/_matrix/client/v3/keys/signatures/upload', requireAuth(), async (c) =
   }
 
   console.log('[signatures/upload] Request from:', signerUserId);
-  console.log('[signatures/upload] Body:', JSON.stringify(body));
 
   // body is a map of user_id -> key_id -> signed_key_object
   const failures: Record<string, Record<string, { errcode: string; error: string }>> = {};
@@ -899,7 +862,6 @@ app.post('/_matrix/client/v3/keys/signatures/upload', requireAuth(), async (c) =
         const signatures = signedKeyObj.signatures?.[signerUserId] || {};
 
         console.log('[signatures/upload] Processing:', { userId, keyId, hasDeviceId: !!signedKeyObj.device_id });
-        console.log('[signatures/upload] Signatures to store:', JSON.stringify(signatures));
 
         // Store all signatures in the database
         for (const [signerKeyId, signature] of Object.entries(signatures)) {
@@ -957,7 +919,7 @@ app.post('/_matrix/client/v3/keys/signatures/upload', requireAuth(), async (c) =
         }
 
         // Record key change for sync notifications
-        await recordKeyChange(db, userId, signedKeyObj.device_id || null, 'update');
+        await recordKeyChange(c.env, userId, signedKeyObj.device_id || null, 'update');
       } catch (err) {
         console.error('[signatures/upload] Error processing signature:', err);
         if (!failures[userId]) failures[userId] = {};
@@ -1023,162 +985,11 @@ app.get('/_matrix/client/v3/auth/m.login.sso/redirect', async (c) => {
 
 // GET /_matrix/client/v3/auth/m.login.sso/callback - SSO callback for UIA
 // This endpoint handles the return from SSO authentication
-app.get('/_matrix/client/v3/auth/m.login.sso/callback', async (c) => {
-  const code = c.req.query('code');
-  const state = c.req.query('state'); // This is the UIA session ID
-  const error = c.req.query('error');
-  const errorDescription = c.req.query('error_description');
-
-  if (error) {
-    console.log('[keys/sso] SSO error:', error, errorDescription);
-    return c.html(generateSSOErrorPage('SSO Authentication Failed', errorDescription || error));
-  }
-
-  if (!state) {
-    return c.html(generateSSOErrorPage('Invalid Request', 'Missing state parameter'));
-  }
-
-  // Retrieve the UIA session
-  const sessionJson = await c.env.CACHE.get(`uia_session:${state}`);
-  if (!sessionJson) {
-    return c.html(generateSSOErrorPage('Session Expired', 'The UIA session has expired. Please try again.'));
-  }
-
-  const session = JSON.parse(sessionJson);
-
-  // If code is present, SSO was successful
-  // For UIA purposes, we just need to verify the user authenticated - we don't need the token
-  if (code) {
-    // Mark SSO as completed in the session
-    session.completed_stages = session.completed_stages || [];
-    if (!session.completed_stages.includes('m.login.sso')) {
-      session.completed_stages.push('m.login.sso');
-    }
-    session.sso_completed_at = Date.now();
-
-    // Save updated session
-    await c.env.CACHE.put(`uia_session:${state}`, JSON.stringify(session), { expirationTtl: 300 });
-
-    console.log('[keys/sso] SSO completed for UIA session:', state);
-
-    // Return success page that tells the client to retry the original request
-    return c.html(generateSSOSuccessPage(state, session.redirect_url));
-  }
-
-  return c.html(generateSSOErrorPage('Authentication Failed', 'No authorization code received'));
+app.get('/_matrix/client/v3/auth/m.login.sso/callback', (c) => {
+  return c.json({ errcode: 'M_FORBIDDEN', error: 'SSO reauthentication is not implemented; use the password approval flow' }, 403);
 });
-
-// POST /_matrix/client/v3/auth/m.login.token/submit - Submit token for UIA
-// Alternative flow for OIDC users who have a valid token
-app.post('/_matrix/client/v3/auth/m.login.token/submit', requireAuth(), async (c) => {
-  const userId = c.get('userId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  const { session } = body;
-
-  if (!session) {
-    return Errors.missingParam('session').toResponse();
-  }
-
-  // Retrieve the UIA session
-  const sessionJson = await c.env.CACHE.get(`uia_session:${session}`);
-  if (!sessionJson) {
-    return c.json({
-      errcode: 'M_UNKNOWN',
-      error: 'UIA session not found or expired',
-    }, 404);
-  }
-
-  const sessionData = JSON.parse(sessionJson);
-
-  // Verify the session belongs to this user
-  if (sessionData.user_id !== userId) {
-    return Errors.forbidden('Session user mismatch').toResponse();
-  }
-
-  // The user is already authenticated with a valid access token
-  // This is sufficient for token-based UIA completion
-  sessionData.completed_stages = sessionData.completed_stages || [];
-  if (!sessionData.completed_stages.includes('m.login.token')) {
-    sessionData.completed_stages.push('m.login.token');
-  }
-  sessionData.token_completed_at = Date.now();
-
-  // Save updated session
-  await c.env.CACHE.put(`uia_session:${session}`, JSON.stringify(sessionData), { expirationTtl: 300 });
-
-  console.log('[keys/token] Token UIA completed for session:', session);
-
-  return c.json({
-    completed: ['m.login.token'],
-    session,
-  });
+app.post('/_matrix/client/v3/auth/m.login.token/submit', requireAuth(), (c) => {
+  return c.json({ errcode: 'M_FORBIDDEN', error: 'An access token alone cannot authorize a key reset' }, 403);
 });
-
-// Helper: Generate SSO error page
-function generateSSOErrorPage(title: string, message: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-    .container { background: #1e293b; padding: 40px; border-radius: 12px; max-width: 400px; text-align: center; border: 1px solid #334155; }
-    h1 { color: #ef4444; margin-bottom: 16px; }
-    p { color: #94a3b8; margin-bottom: 24px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>${title}</h1>
-    <p>${message}</p>
-    <p>You can close this window and try again.</p>
-  </div>
-</body>
-</html>`;
-}
-
-// Helper: Generate SSO success page
-function generateSSOSuccessPage(sessionId: string, _redirectUrl?: string): string {
-  // Note: _redirectUrl is reserved for future use when we support custom redirects
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authentication Successful</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-    .container { background: #1e293b; padding: 40px; border-radius: 12px; max-width: 400px; text-align: center; border: 1px solid #334155; }
-    h1 { color: #22c55e; margin-bottom: 16px; }
-    p { color: #94a3b8; margin-bottom: 24px; }
-    .session { font-family: monospace; background: #0f172a; padding: 8px 16px; border-radius: 8px; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Authentication Successful</h1>
-    <p>Your identity has been verified.</p>
-    <p>You can now return to your Matrix client and complete the operation.</p>
-    <p class="session">Session: ${sessionId}</p>
-    <script>
-      // Try to notify the parent window/opener if this was opened as a popup
-      if (window.opener) {
-        window.opener.postMessage({ type: 'uia_complete', session: '${sessionId}' }, '*');
-        setTimeout(() => window.close(), 2000);
-      }
-    </script>
-  </div>
-</body>
-</html>`;
-}
 
 export default app;

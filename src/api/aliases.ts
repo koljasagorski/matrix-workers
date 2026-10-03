@@ -3,6 +3,7 @@
 //
 // Room aliases provide human-readable names for rooms (e.g., #general:server.org)
 
+import { resolveRoomAlias } from '../services/remote-rooms';
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
@@ -16,32 +17,7 @@ const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/directory/room/:roomAlias - Resolve room alias
 app.get('/_matrix/client/v3/directory/room/:roomAlias', async (c) => {
-  const roomAlias = decodeURIComponent(c.req.param('roomAlias'));
-  const db = c.env.DB;
-
-  // Find alias in database
-  const alias = await db.prepare(`
-    SELECT room_id, servers FROM room_aliases WHERE alias = ?
-  `).bind(roomAlias).first<{ room_id: string; servers: string | null }>();
-
-  if (!alias) {
-    return Errors.notFound('Room alias not found').toResponse();
-  }
-
-  // Parse servers list
-  let servers: string[] = [c.env.SERVER_NAME];
-  if (alias.servers) {
-    try {
-      servers = JSON.parse(alias.servers);
-    } catch {
-      // Use default
-    }
-  }
-
-  return c.json({
-    room_id: alias.room_id,
-    servers,
-  });
+  return c.json(await resolveRoomAlias(c.env, c.req.param('roomAlias')));
 });
 
 // PUT /_matrix/client/v3/directory/room/:roomAlias - Create room alias

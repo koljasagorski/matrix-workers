@@ -2,7 +2,7 @@
 
 import { Hono } from 'hono';
 import type { AppEnv, RoomCreateContent, RoomMemberContent, PDU } from '../types';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, formatRoomAlias } from '../utils/ids';
 import { invalidateRoomCache } from '../services/room-cache';
@@ -25,9 +25,20 @@ import {
   getEvent,
   notifyUsersOfEvent,
 } from '../services/database';
-import type { JoinResult } from '../workflows';
+import { signEvent, eventReferenceId, wireEvent, FEDERATED_ROOM_VERSIONS } from '../services/federation-events';
+import { getServerSigningKey } from '../services/federation-keys';
+import { queueRoomEvent } from '../services/federation-delivery';
+import { getTransaction, storeTransaction } from '../services/transactions';
+import { checkEventAuth } from '../services/event-auth';
+import { resolveRoomAlias, locateRoom, joinRemoteRoom, remoteRoomSummary } from '../services/remote-rooms';
+import { getRemoteHistory, getHistoricalEvent } from '../services/room-history';
 
 const app = new Hono<AppEnv>();
+app.onError((error, c) => {
+  if (error instanceof MatrixApiError) return error.toResponse();
+  console.error('[rooms] Request failed:', error);
+  return c.json({ errcode: 'M_UNKNOWN', error: 'Room request failed; please retry' }, 502);
+});
 
 // Validation for initial_state events
 interface StateEventValidation {
@@ -367,69 +378,17 @@ app.get('/_matrix/client/v3/joined_rooms', requireAuth(), async (c) => {
   return c.json({ joined_rooms: rooms });
 });
 
-// Helper to extract server name from room ID (!localpart:server)
-function getServerFromRoomId(roomId: string): string | null {
-  const match = roomId.match(/^!.+:(.+)$/);
-  return match ? match[1] : null;
-}
-
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
 
-  // Extract server from room ID to check if it's a remote room
-  const roomServer = getServerFromRoomId(roomId);
-  const isRemoteRoom = roomServer && roomServer !== c.env.SERVER_NAME;
-
-  // Check if room exists locally
   const room = await getRoom(c.env.DB, roomId);
-
-  // For remote rooms that don't exist locally, use the workflow for federation
-  if (!room && isRemoteRoom && roomServer) {
-    console.log('[rooms] Remote room join via workflow', { roomId, roomServer, userId });
-
-    // Trigger the RoomJoinWorkflow for durable federation handling
-    const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
-      params: {
-        roomId,
-        userId,
-        isRemote: true,
-        remoteServer: roomServer,
-      },
-    });
-
-    // Wait for the workflow to complete (with timeout)
-    // The workflow handles retries internally
-    try {
-      const status = await instance.status();
-      console.log('[rooms] Workflow status', { roomId, status });
-
-      // If workflow is still running, return accepted
-      if (status.status === 'running' || status.status === 'queued') {
-        // Return success - the join is in progress
-        // Client will see the room appear in sync when complete
-        return c.json({ room_id: roomId });
-      }
-
-      // Check if workflow completed successfully
-      const output = status.output as JoinResult | undefined;
-      if (status.status === 'complete' && output?.success) {
-        return c.json({ room_id: roomId });
-      }
-
-      // Workflow failed
-      console.error('[rooms] Workflow failed', { roomId, status });
-      return Errors.unknown('Failed to join remote room').toResponse();
-    } catch (err) {
-      console.error('[rooms] Workflow error', { roomId, error: err });
-      return Errors.unknown('Failed to join remote room').toResponse();
-    }
-  }
-
-  // Local room handling (existing code)
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
+  if (!room || (room.creator_id && !room.creator_id.endsWith(`:${c.env.SERVER_NAME}`) &&
+      (await getMembership(c.env.DB, roomId, userId))?.membership !== 'join')) {
+    const location = await locateRoom(c.env, roomId, [...(c.req.queries('via') ?? []), ...(c.req.queries('server_name') ?? [])]);
+    const body = await c.req.json<{ reason?: string }>().catch(() => ({} as { reason?: string }));
+    return c.json({ room_id: await joinRemoteRoom(c.env, location, userId, typeof body.reason === 'string' ? body.reason : undefined) });
   }
 
   // Check current membership
@@ -632,7 +591,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/knock', requireAuth(), async (c) => {
 // POST /_matrix/client/v3/knock/:roomIdOrAlias - Knock by ID or alias
 app.post('/_matrix/client/v3/knock/:roomIdOrAlias', requireAuth(), async (c) => {
   const userId = c.get('userId');
-  const roomIdOrAlias = c.req.param('roomIdOrAlias');
+  const roomIdOrAlias = c.req.param('roomIdOrAlias')!;
   const db = c.env.DB;
 
   let body: { reason?: string; server_name?: string[] };
@@ -889,17 +848,44 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
   }
 
   const from = c.req.query('from');
-  const dir = (c.req.query('dir') || 'b') as 'f' | 'b';
-  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
+  const dir = c.req.query('dir') || 'b';
+  if (dir !== 'b' && dir !== 'f') return Errors.invalidParam('dir').toResponse();
+  const requestedLimit = Number(c.req.query('limit') || '10');
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 0) return Errors.invalidParam('limit').toResponse();
+  const limit = Math.min(requestedLimit, 100);
+  let events: PDU[] = [];
+  let endToken: string | undefined;
 
   // Parse token - handle both 's123' format (from sliding-sync) and plain '123' format
   let fromToken: number | undefined;
-  if (from) {
-    const tokenStr = from.startsWith('s') ? from.slice(1) : from;
-    const parsed = parseInt(tokenStr);
-    fromToken = isNaN(parsed) ? undefined : parsed;
+  if (from?.startsWith('rh_')) {
+    if (dir !== 'b') return Errors.invalidParam('dir', 'Historical cursors support backwards pagination').toResponse();
+    if (limit > 0) {
+      const page = await getRemoteHistory(c.env, roomId, userId, from, limit);
+      events = page.events;
+      endToken = page.end;
+    }
+  } else {
+    if (from) {
+      const tokenStr = from.replace(/^s?(-?\d+)(?:_td\d+)?(?:_dk\d+)?$/, '$1');
+      if (!/^-?\d+$/.test(tokenStr) || !Number.isSafeInteger(Number(tokenStr))) return Errors.invalidParam('from').toResponse();
+      fromToken = Number(tokenStr);
+    }
+    const page = await getRoomEvents(c.env.DB, roomId, fromToken, limit, dir);
+    events = page.events;
+    if (events.length) endToken = `s${page.end}`;
+    if (dir === 'b' && events.length < limit) {
+      const oldest = events.at(-1) ?? (await getRoomEvents(c.env.DB, roomId, undefined, 1, 'f')).events[0];
+      if (oldest) {
+        const anchor = await getEvent(c.env.DB, oldest.event_id);
+        if (anchor) {
+          const history = await getRemoteHistory(c.env, roomId, userId, anchor, limit - events.length);
+          events.push(...history.events);
+          endToken = history.end;
+        }
+      }
+    }
   }
-  const { events, end } = await getRoomEvents(c.env.DB, roomId, fromToken, limit, dir);
 
   // Format events for client
   const clientEvents = events.map(e => ({
@@ -913,18 +899,14 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     unsigned: e.unsigned,
   }));
 
-  // Build response - omit 'end' if no events returned (reached start/end of timeline)
-  // This prevents infinite retry loops when client paginates past available events
-  // Use 's' prefix for consistency with sliding-sync prev_batch tokens
+  // Empty filtered pages can still have a continuation. Only omit 'end' once
+  // there is no more history; transient federation failures return an error.
   const response: { start: string; end?: string; chunk: typeof clientEvents } = {
     start: from || 's0',
     chunk: clientEvents,
   };
 
-  // Only include 'end' if we have events to paginate from
-  if (events.length > 0) {
-    response.end = `s${end}`;
-  }
+  if (endToken) response.end = endToken;
 
   return c.json(response);
 });
@@ -941,7 +923,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  const event = await getEvent(c.env.DB, eventId);
+  const event = await getEvent(c.env.DB, eventId) ?? await getHistoricalEvent(c.env, roomId, userId, eventId);
   if (!event || event.room_id !== roomId) {
     return Errors.notFound('Event not found').toResponse();
   }
@@ -964,71 +946,48 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
   const txnId = c.req.param('txnId');
-
-  // Check membership
+  const transactionKey = `room-send:${c.get('deviceId')}:${roomId}:${eventType}:${txnId}`;
+  const previous = await getTransaction(c.env.DB, userId, transactionKey);
+  if (previous?.eventId) {
+    const stored = await getEvent(c.env.DB, previous.eventId);
+    const room = await getRoom(c.env.DB, roomId);
+    if (stored && room) await queueRoomEvent(c.env, stored, room.room_version);
+    return c.json({ event_id: previous.eventId });
+  }
   const membership = await getMembership(c.env.DB, roomId, userId);
-  if (!membership || membership.membership !== 'join') {
-    return Errors.forbidden('Not a member of this room').toResponse();
+  if (membership?.membership !== 'join') return Errors.forbidden('Not a member of this room').toResponse();
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound().toResponse();
+  let content: Record<string, unknown>;
+  try { content = await c.req.json(); } catch { return Errors.badJson().toResponse(); }
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return Errors.badJson().toResponse();
+  const state = await getRoomState(c.env.DB, roomId);
+  const authEvents = state.filter(e =>
+    (e.type === 'm.room.create' && room.room_version !== '12') ||
+    e.type === 'm.room.power_levels' || (e.type === 'm.room.member' && e.state_key === userId));
+  const latest = await c.env.DB.prepare(`SELECT event_id,depth FROM events WHERE room_id=? AND stream_ordering IS NOT NULL
+    ORDER BY depth DESC,stream_ordering DESC LIMIT 1`).bind(roomId).first<{event_id:string;depth:number}>();
+  const event: PDU = { event_id:await generateEventId(c.env.SERVER_NAME), room_id:roomId, sender:userId, type:eventType,
+    content, origin_server_ts:Date.now(), depth:Math.min((latest?.depth ?? 0)+1,Number.MAX_SAFE_INTEGER),
+    auth_events:authEvents.map(e=>e.event_id), prev_events:latest ? [latest.event_id] : [], unsigned:{transaction_id:txnId} };
+  const allowed = checkEventAuth(event, state, room.room_version);
+  if (!allowed.allowed) return Errors.forbidden(allowed.error).toResponse();
+  if (FEDERATED_ROOM_VERSIONS.includes(room.room_version)) {
+    const key = await getServerSigningKey(c.env.DB);
+    if (!key) throw new Error('Server signing key unavailable');
+    const signed = await signEvent(wireEvent(event, room.room_version), room.room_version, c.env.SERVER_NAME, key);
+    Object.assign(event, signed, { event_id: await eventReferenceId(signed, room.room_version) });
   }
-
-  let content: any;
-  try {
-    content = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
-  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-
-  const authEvents: string[] = [];
-  if (createEvent) authEvents.push(createEvent.event_id);
-  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
-  if (membership) authEvents.push(membership.eventId);
-
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
-  const prevEvents = latestEvents.map(e => e.event_id);
-
-  const event: PDU = {
-    event_id: eventId,
-    room_id: roomId,
-    sender: userId,
-    type: eventType,
-    content,
-    origin_server_ts: Date.now(),
-    unsigned: { transaction_id: txnId },
-    depth: (latestEvents[0]?.depth ?? 0) + 1,
-    auth_events: authEvents,
-    prev_events: prevEvents,
-  };
-
   await storeEvent(c.env.DB, event);
-
-  // Notify all room members that a new message was sent (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
-
-  // Send push notifications via durable workflow (fire and forget)
-  // Only for message and encrypted event types
+  await storeTransaction(c.env.DB, userId, transactionKey, event.event_id);
+  await queueRoomEvent(c.env, event, room.room_version);
+  await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);
   if (eventType === 'm.room.message' || eventType === 'm.room.encrypted') {
-    c.executionCtx.waitUntil(
-      c.env.PUSH_NOTIFICATION_WORKFLOW.create({
-        params: {
-          eventId,
-          roomId,
-          eventType,
-          sender: userId,
-          content,
-          originServerTs: event.origin_server_ts,
-        },
-      }).catch(err => {
-        console.error('[rooms] Push notification workflow error:', err);
-      })
-    );
+    c.executionCtx.waitUntil(c.env.PUSH_NOTIFICATION_WORKFLOW.create({ params: {
+      eventId:event.event_id,roomId,eventType,sender:userId,content,originServerTs:event.origin_server_ts,
+    } }).catch(error => console.error('[rooms] Push notification failed:',error)));
   }
-
-  return c.json({ event_id: eventId });
+  return c.json({ event_id:event.event_id });
 });
 
 // POST /_matrix/client/v3/rooms/:roomId/invite - Invite a user
@@ -1600,27 +1559,16 @@ app.get('/_matrix/client/v3/rooms/:roomId/aliases', requireAuth(), async (c) => 
 // POST /_matrix/client/v3/join/:roomIdOrAlias - Join room by ID or alias
 app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   const userId = c.get('userId');
-  const roomIdOrAlias = decodeURIComponent(c.req.param('roomIdOrAlias'));
+  const roomIdOrAlias = c.req.param('roomIdOrAlias')!;
   const db = c.env.DB;
 
-  let roomId: string;
-
-  // Determine if it's an alias or room ID
-  if (roomIdOrAlias.startsWith('#')) {
-    // It's an alias, resolve it
-    const resolved = await getRoomByAlias(db, roomIdOrAlias);
-    if (!resolved) {
-      return Errors.notFound('Room alias not found').toResponse();
-    }
-    roomId = resolved;
-  } else {
-    roomId = roomIdOrAlias;
-  }
-
-  // Check if room exists
+  const location = await locateRoom(c.env, roomIdOrAlias, [...(c.req.queries('via') ?? []), ...(c.req.queries('server_name') ?? [])]);
+  const roomId = location.room_id;
   const room = await getRoom(db, roomId);
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
+  if (!room || (room.creator_id && !room.creator_id.endsWith(`:${c.env.SERVER_NAME}`) &&
+      (await getMembership(db, roomId, userId))?.membership !== 'join')) {
+    const body = await c.req.json<{ reason?: string }>().catch(() => ({} as { reason?: string }));
+    return c.json({ room_id: await joinRemoteRoom(c.env, location, userId, typeof body.reason === 'string' ? body.reason : undefined) });
   }
 
   // Check current membership
@@ -1685,17 +1633,7 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
 // Room alias endpoints
 // GET /_matrix/client/v3/directory/room/:roomAlias
 app.get('/_matrix/client/v3/directory/room/:roomAlias', async (c) => {
-  const alias = decodeURIComponent(c.req.param('roomAlias'));
-
-  const roomId = await getRoomByAlias(c.env.DB, alias);
-  if (!roomId) {
-    return Errors.notFound('Room alias not found').toResponse();
-  }
-
-  return c.json({
-    room_id: roomId,
-    servers: [c.env.SERVER_NAME],
-  });
+  return c.json(await resolveRoomAlias(c.env, c.req.param('roomAlias')));
 });
 
 // PUT /_matrix/client/v3/directory/room/:roomAlias
@@ -1752,31 +1690,19 @@ app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async 
 
 // GET /_matrix/client/v1/room_summary/:roomIdOrAlias - Get a summary of a room
 // Allows previewing a room without joining it (if permitted by room settings)
-app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
-  const roomIdOrAlias = decodeURIComponent(c.req.param('roomIdOrAlias'));
+for (const path of ['/_matrix/client/v1/room_summary/:roomIdOrAlias', '/_matrix/client/unstable/im.nheko.summary/summary/:roomIdOrAlias']) app.get(path, async (c) => {
+  const roomIdOrAlias = c.req.param('roomIdOrAlias')!;
   const db = c.env.DB;
 
-  let roomId = roomIdOrAlias;
-
-  // Resolve alias to room_id if needed
-  if (roomIdOrAlias.startsWith('#')) {
-    const aliasResult = await db.prepare(
-      `SELECT room_id FROM room_aliases WHERE alias = ?`
-    ).bind(roomIdOrAlias).first<{ room_id: string }>();
-    if (!aliasResult) {
-      return Errors.notFound('Room alias not found').toResponse();
-    }
-    roomId = aliasResult.room_id;
-  }
+  const location = await locateRoom(c.env, roomIdOrAlias, [...(c.req.queries('via') ?? []), ...(c.req.queries('server_name') ?? [])]);
+  const roomId = location.room_id;
 
   // Get room info
   const room = await db.prepare(
     `SELECT room_id, room_version, is_public FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string; room_version: string; is_public: number }>();
 
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
+  if (!room) return c.json(await remoteRoomSummary(c.env, location));
 
   // Get room state events we need
   const stateEvents = await db.prepare(`

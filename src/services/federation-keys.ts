@@ -3,6 +3,7 @@
 // Includes notary support for key query endpoints
 
 import { verifySignature, signJson, base64UrlDecode } from '../utils/crypto';
+import { assertFederationServer, assertFederationUrl, readFederationJson } from './federation-http';
 import { discoverServer, buildServerUrl } from './server-discovery';
 
 export interface ServerKeyResponse {
@@ -35,6 +36,7 @@ export async function fetchRemoteServerKeys(
   db: D1Database,
   cache: KVNamespace
 ): Promise<RemoteServerKey[]> {
+  assertFederationServer(serverName);
   const cacheKey = `federation:keys:${serverName}`;
 
   // Check KV cache first
@@ -43,14 +45,14 @@ export async function fetchRemoteServerKeys(
     return JSON.parse(cached);
   }
 
-  // Check D1 cache for non-expired keys
+  // Keep historical keys: event signatures are checked at their event timestamp.
   const dbKeys = await db
     .prepare(
       `SELECT server_name, key_id, public_key, valid_from, valid_until, fetched_at, verified
        FROM remote_server_keys
-       WHERE server_name = ? AND (valid_until IS NULL OR valid_until > ?)`
+       WHERE server_name = ?`
     )
-    .bind(serverName, Date.now())
+    .bind(serverName)
     .all<RemoteServerKey>();
 
   // If we have recent keys in D1 (fetched within last hour), use them
@@ -62,7 +64,12 @@ export async function fetchRemoteServerKeys(
 
   // Fetch fresh keys from remote server
   try {
-    const keys = await fetchKeysFromRemote(serverName, cache);
+    let keys: RemoteServerKey[];
+    try { keys = await fetchKeysFromRemote(serverName, cache); }
+    catch (error) {
+      if (serverName === 'matrix.org') throw error;
+      keys = await fetchKeysFromNotary(serverName, db, cache);
+    }
 
     // Store in D1
     for (const key of keys) {
@@ -111,7 +118,10 @@ async function fetchKeysFromRemote(
   const discovery = await discoverServer(serverName, cache);
   const serverUrl = buildServerUrl(discovery);
 
+  assertFederationUrl(serverUrl);
   const response = await fetch(`${serverUrl}/_matrix/key/v2/server`, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(15000),
     headers: {
       Accept: 'application/json',
     },
@@ -126,7 +136,7 @@ async function fetchKeysFromRemote(
     throw new Error(`HTTP ${response.status} from ${serverName}`);
   }
 
-  const keyResponse: ServerKeyResponse = await response.json();
+  const keyResponse = await readFederationJson(response, 262144) as ServerKeyResponse;
 
   // Validate the response has the expected server name
   if (keyResponse.server_name !== serverName) {
@@ -174,6 +184,8 @@ async function fetchKeysFromRemote(
     });
   }
 
+  if (!keys.some(key => key.verified)) throw new Error('Server key response has no valid self-signature');
+
   // Process old keys (for verifying historical signatures)
   for (const [keyId, keyData] of Object.entries(keyResponse.old_verify_keys || {})) {
     try {
@@ -201,6 +213,42 @@ async function fetchKeysFromRemote(
   return keys;
 }
 
+/** Historical keys may outlive their origin. Trust only the fixed matrix.org notary over HTTPS. */
+async function fetchKeysFromNotary(serverName: string, db: D1Database, cache: KVNamespace, keyId?: string): Promise<RemoteServerKey[]> {
+  const response = await fetch(`https://matrix.org/_matrix/key/v2/query/${encodeURIComponent(serverName)}${keyId ? '/' + encodeURIComponent(keyId) : ''}`, {
+    headers: { Accept: 'application/json' }, redirect: 'manual', signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error('Key notary unavailable');
+  const body = await readFederationJson(response, 1048576) as { server_keys?: ServerKeyResponse[] };
+  if (!Array.isArray(body.server_keys)) throw new Error('Invalid notary response');
+  const notaryKeys = await fetchRemoteServerKeys('matrix.org', db, cache);
+  const keys: RemoteServerKey[] = [];
+  for (const document of body.server_keys) {
+    if (document.server_name !== serverName) continue;
+    let trusted = false;
+    for (const key of notaryKeys) {
+      if (await verifySignature(document, 'matrix.org', key.key_id, key.public_key)) { trusted = true; break; }
+    }
+    if (!trusted) continue;
+    for (const [id, key] of Object.entries(document.verify_keys ?? {})) {
+      if (id.startsWith('ed25519:') && base64UrlDecode(key.key).length === 32) keys.push({ server_name:serverName,
+        key_id:id, public_key:key.key, valid_from:0, valid_until:document.valid_until_ts, fetched_at:Date.now(), verified:true });
+    }
+    for (const [id, key] of Object.entries(document.old_verify_keys ?? {})) {
+      if (id.startsWith('ed25519:') && base64UrlDecode(key.key).length === 32 && key.expired_ts) keys.push({ server_name:serverName,
+        key_id:id, public_key:key.key, valid_from:0, valid_until:key.expired_ts, fetched_at:Date.now(), verified:true });
+    }
+  }
+  if (!keys.length) throw new Error(`No trusted historical keys for ${serverName}`);
+  return keys;
+}
+
+export async function fetchHistoricalServerKeys(server: string, keyId: string, db: D1Database, cache: KVNamespace) {
+  assertFederationServer(server);
+  if (!/^ed25519:[A-Za-z0-9_]+$/.test(keyId)) throw new Error('Invalid signing key ID');
+  return fetchKeysFromNotary(server, db, cache, keyId);
+}
+
 /**
  * Fetch the raw key response from a remote server (for notary use)
  * Returns the full ServerKeyResponse including signatures
@@ -213,7 +261,10 @@ export async function fetchRawServerKeyResponse(
     const discovery = await discoverServer(serverName, cache);
     const serverUrl = buildServerUrl(discovery);
 
+    assertFederationUrl(serverUrl);
     const response = await fetch(`${serverUrl}/_matrix/key/v2/server`, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15000),
       headers: {
         Accept: 'application/json',
       },
@@ -227,7 +278,7 @@ export async function fetchRawServerKeyResponse(
       return null;
     }
 
-    const keyResponse: ServerKeyResponse = await response.json();
+    const keyResponse = await readFederationJson(response, 262144) as ServerKeyResponse;
 
     // Validate server name matches
     if (keyResponse.server_name !== serverName) {
@@ -515,10 +566,12 @@ export async function makeFederationRequest(
   localServerName: string,
   signingKey: SigningKey,
   cache: KVNamespace,
-  body?: unknown
+  body?: unknown,
+  signal?: AbortSignal
 ): Promise<Response> {
+  assertFederationServer(serverName);
   // Discover the remote server's endpoint
-  const discovery = await discoverServer(serverName, cache);
+  const discovery = await discoverServer(serverName, cache, signal);
   const serverUrl = buildServerUrl(discovery);
 
   // Build the full URI (path only, not full URL)
@@ -535,8 +588,11 @@ export async function makeFederationRequest(
   );
 
   // Make the request
+  assertFederationUrl(serverUrl);
   const options: RequestInit = {
     method,
+    redirect: 'manual',
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000),
     headers: {
       'Authorization': authHeader,
       'Content-Type': 'application/json',
@@ -578,14 +634,15 @@ export async function federationPost(
   body: unknown,
   localServerName: string,
   db: D1Database,
-  cache: KVNamespace
+  cache: KVNamespace,
+  signal?: AbortSignal
 ): Promise<Response> {
   const signingKey = await getServerSigningKey(db);
   if (!signingKey) {
     throw new Error('Server signing key not configured');
   }
 
-  return makeFederationRequest('POST', serverName, path, localServerName, signingKey, cache, body);
+  return makeFederationRequest('POST', serverName, path, localServerName, signingKey, cache, body, signal);
 }
 
 /**

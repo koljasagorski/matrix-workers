@@ -46,7 +46,7 @@ describe('login security', () => {
     vi.mocked(getPasswordHash).mockResolvedValue(await hashPassword('correct-password'));
     vi.mocked(getUserById).mockResolvedValue({ user_id: '@admin:m.sgr.ski', is_deactivated: false } as never);
     const start = Date.now();
-    const response = await post('/_matrix/client/v3/login', { type: 'm.login.password', identifier: { type: 'm.id.user', user: 'admin' }, password: 'correct-password' });
+    const response = await post('/_matrix/client/v3/login', { type: 'm.login.password', identifier: { type: 'm.id.user', user: 'admin' }, password: 'correct-password', refresh_token: true });
     expect(response.status).toBe(200);
     const data = await response.json();
     expect(data.expires_in_ms).toBe(3600000);

@@ -6,6 +6,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { getUserById, updateUserProfile } from '../services/database';
 import { parseUserId, isLocalServerName } from '../utils/ids';
+import { propagateProfile } from '../services/profile-propagation';
 
 const app = new Hono<AppEnv>();
 
@@ -82,9 +83,10 @@ app.put('/_matrix/client/v3/profile/:userId/displayname', requireAuth(), async (
     return Errors.badJson().toResponse();
   }
 
-  const { displayname } = body;
-
-  await updateUserProfile(c.env.DB, userId, displayname);
+  const displayname = body?.displayname;
+  if (displayname !== null && (typeof displayname !== 'string' || displayname.length > 256)) return Errors.invalidParam('displayname').toResponse();
+  await updateUserProfile(c.env.DB, userId, displayname ?? '');
+  await propagateProfile(c.env, userId);
 
   return c.json({});
 });
@@ -129,9 +131,11 @@ app.put('/_matrix/client/v3/profile/:userId/avatar_url', requireAuth(), async (c
     return Errors.badJson().toResponse();
   }
 
-  const { avatar_url } = body;
-
-  await updateUserProfile(c.env.DB, userId, undefined, avatar_url);
+  const avatar_url = body?.avatar_url;
+  if (avatar_url !== null && (typeof avatar_url !== 'string' || avatar_url.length > 2048 ||
+      (avatar_url !== '' && !/^mxc:\/\/[^/]+\/[^/\s]+$/.test(avatar_url)))) return Errors.invalidParam('avatar_url').toResponse();
+  await updateUserProfile(c.env.DB, userId, undefined, avatar_url ?? '');
+  await propagateProfile(c.env, userId);
 
   return c.json({});
 });

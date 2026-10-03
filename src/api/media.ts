@@ -6,8 +6,18 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateOpaqueId } from '../utils/ids';
 import { validateUrlForPreview } from '../utils/url-validator';
+import { remoteMedia } from '../services/remote-media';
 
 const app = new Hono<AppEnv>();
+// Uploaded active content must never execute with the admin interface's origin.
+app.use('*', async (c, next) => {
+  await next();
+  if (c.req.path.includes('/download/') || c.req.path.includes('/thumbnail/')) {
+    c.res.headers.set('Content-Security-Policy', "sandbox; default-src 'none'; script-src 'none'; object-src 'none'");
+    c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  }
+});
+
 
 // Maximum upload size (50MB)
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
@@ -80,9 +90,12 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
 
-  // Only serve local media for now
+  // Fetch remote media through authenticated federation
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    if (c.req.query('allow_remote') === 'false') return Errors.notFound('Remote media disabled').toResponse();
+    const denied = await requireAuth()(c, async () => {});
+    if (denied) return denied;
+    return remoteMedia(c.env, serverName, mediaId);
   }
 
   // Get from R2
@@ -112,9 +125,12 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
   const mediaId = c.req.param('mediaId');
   const requestedFilename = c.req.param('filename');
 
-  // Only serve local media for now
+  // Fetch remote media through authenticated federation
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    if (c.req.query('allow_remote') === 'false') return Errors.notFound('Remote media disabled').toResponse();
+    const denied = await requireAuth()(c, async () => {});
+    if (denied) return denied;
+    return remoteMedia(c.env, serverName, mediaId, { filename: requestedFilename });
   }
 
   // Get from R2
@@ -144,9 +160,12 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const height = Math.min(parseInt(c.req.query('height') || '96'), 1920);
   const method = c.req.query('method') || 'scale';
 
-  // Only serve local media for now
+  // Fetch remote media through authenticated federation
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    if (c.req.query('allow_remote') === 'false') return Errors.notFound('Remote media disabled').toResponse();
+    const denied = await requireAuth()(c, async () => {});
+    if (denied) return denied;
+    return remoteMedia(c.env, serverName, mediaId, { thumbnail: { width, height, method, animated: c.req.query('animated') === 'true' } });
   }
 
   // Get media metadata
@@ -529,7 +548,7 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
   const mediaId = c.req.param('mediaId');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return remoteMedia(c.env, serverName, mediaId);
   }
 
   const object = await c.env.MEDIA.get(mediaId);
@@ -558,7 +577,7 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
   const requestedFilename = c.req.param('filename');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return remoteMedia(c.env, serverName, mediaId, { filename: requestedFilename });
   }
 
   const object = await c.env.MEDIA.get(mediaId);
@@ -587,7 +606,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const method = c.req.query('method') || 'scale';
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return remoteMedia(c.env, serverName, mediaId, { thumbnail: { width, height, method, animated: c.req.query('animated') === 'true' } });
   }
 
   // Get media metadata

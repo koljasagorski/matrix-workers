@@ -86,19 +86,12 @@ export async function hashToken(token: string): Promise<string> {
   return sha256(token);
 }
 
-// Ed25519 algorithm parameters for Cloudflare Workers
-// Note: NODE-ED25519 is Cloudflare Workers' proprietary Ed25519 implementation
-interface Ed25519Params {
-  name: 'NODE-ED25519';
-  namedCurve: 'NODE-ED25519';
-}
-
 interface Ed25519KeyPair {
   publicKey: CryptoKey;
   privateKey: CryptoKey;
 }
 
-// Generate Ed25519 key pair for signing using Cloudflare Workers' NODE-ED25519 algorithm
+// Generate an Ed25519 key pair using standard Web Crypto.
 export async function generateSigningKeyPair(): Promise<{
   publicKey: string;
   privateKeyJwk: JsonWebKey;
@@ -106,7 +99,7 @@ export async function generateSigningKeyPair(): Promise<{
 }> {
   // Generate Ed25519 key pair using Cloudflare Workers' native support
   const keyPair = (await crypto.subtle.generateKey(
-    { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params,
+    { name: 'Ed25519' },
     true, // extractable
     ['sign', 'verify']
   )) as Ed25519KeyPair;
@@ -128,7 +121,7 @@ export async function generateSigningKeyPair(): Promise<{
     .join('')}`;
 
   return {
-    publicKey: base64UrlEncode(publicKeyBytes),
+    publicKey: btoa(String.fromCharCode(...publicKeyBytes)).replace(/=+$/, ''),
     privateKeyJwk,
     keyId,
   };
@@ -169,7 +162,7 @@ export async function signJson(
   const privateKey = await crypto.subtle.importKey(
     'jwk',
     jwk,
-    { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params,
+    { name: 'Ed25519' },
     false,
     ['sign']
   );
@@ -179,13 +172,13 @@ export async function signJson(
 
   // Sign the canonical JSON
   const signatureBytes = await crypto.subtle.sign(
-    { name: 'NODE-ED25519' },
+    { name: 'Ed25519' },
     privateKey,
     new TextEncoder().encode(canonical)
   );
 
   // Encode signature as unpadded base64
-  const signatureB64 = base64UrlEncode(new Uint8Array(signatureBytes));
+  const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signatureBytes))).replace(/=+$/, '');
 
   // Merge with existing signatures if present
   const existingSignatures = (obj.signatures as Record<string, Record<string, string>>) || {};
@@ -229,7 +222,7 @@ export async function verifySignature(
     const publicKey = await crypto.subtle.importKey(
       'raw',
       publicKeyBytes,
-      { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params,
+      { name: 'Ed25519' },
       false,
       ['verify']
     );
@@ -242,7 +235,7 @@ export async function verifySignature(
 
     // Verify the signature
     return await crypto.subtle.verify(
-      { name: 'NODE-ED25519' },
+      { name: 'Ed25519' },
       publicKey,
       signatureBytes,
       new TextEncoder().encode(canonical)

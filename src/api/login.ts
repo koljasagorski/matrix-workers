@@ -26,6 +26,45 @@ import { requireAuth, extractAccessToken } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
 
+const ACCESS_TOKEN_LIFETIME_MS = 60 * 60 * 1000;
+const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+async function createSessionTokens(
+  env: AppEnv['Bindings'],
+  userId: string,
+  deviceId: string | null,
+  supportsRefresh: boolean
+): Promise<{ access_token: string; refresh_token?: string; expires_in_ms?: number }> {
+  const accessToken = await generateAccessToken();
+  const tokenHash = await hashToken(accessToken);
+  const tokenId = await generateOpaqueId(16);
+
+  // Legacy clients such as Element Desktop cannot renew password-login tokens.
+  // Only expire tokens when the client explicitly requests refresh support.
+  await createAccessToken(
+    env.DB, tokenId, tokenHash, userId, deviceId,
+    supportsRefresh ? Date.now() + ACCESS_TOKEN_LIFETIME_MS : null
+  );
+
+  if (!supportsRefresh) {
+    return { access_token: accessToken };
+  }
+
+  const refreshToken = await generateRefreshToken();
+  const refreshTokenHash = await hashToken(refreshToken);
+  await env.SESSIONS.put(
+    `refresh:${refreshTokenHash}`,
+    JSON.stringify({ userId, deviceId, accessTokenId: tokenId, createdAt: Date.now() }),
+    { expirationTtl: REFRESH_TOKEN_TTL_SECONDS }
+  );
+
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    expires_in_ms: ACCESS_TOKEN_LIFETIME_MS,
+  };
+}
+
 // GET /_matrix/client/v3/login - Get supported login flows
 app.get('/_matrix/client/v3/login', (c) => {
   return c.json({
@@ -49,7 +88,10 @@ app.post('/_matrix/client/v3/login', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  const { type, identifier, password, token, device_id, initial_device_display_name } = body;
+  const {
+    type, identifier, password, token, device_id, initial_device_display_name,
+    refresh_token: refreshTokenRequested,
+  } = body;
 
   let userId: string;
 
@@ -130,39 +172,13 @@ app.post('/_matrix/client/v3/login', async (c) => {
   // Create device
   await createDevice(c.env.DB, userId, deviceId, initial_device_display_name);
 
-  // Generate access token
-  const accessToken = await generateAccessToken();
-  const tokenHash = await hashToken(accessToken);
-  const tokenId = await generateOpaqueId(16);
-
-  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
-
-  // Generate refresh token and store in KV with auto-expiration
-  const refreshToken = await generateRefreshToken();
-  const refreshTokenHash = await hashToken(refreshToken);
-
-  // Store refresh token in KV with 7-day TTL
-  await c.env.SESSIONS.put(
-    `refresh:${refreshTokenHash}`,
-    JSON.stringify({
-      userId,
-      deviceId,
-      accessTokenId: tokenId,
-      createdAt: Date.now(),
-    }),
-    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
-  );
-
-  // Access token expires in 1 hour (client should use refresh before this)
-  const expiresInMs = 60 * 60 * 1000; // 1 hour
+  const tokens = await createSessionTokens(c.env, userId, deviceId, refreshTokenRequested === true);
 
   return c.json({
     user_id: userId,
-    access_token: accessToken,
     device_id: deviceId,
     home_server: c.env.SERVER_NAME,
-    refresh_token: refreshToken,
-    expires_in_ms: expiresInMs,
+    ...tokens,
   });
 });
 
@@ -238,37 +254,7 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
     return Errors.unknownToken('Refresh token has already been used').toResponse();
   }
 
-  // Generate new access token
-  const newAccessToken = await generateAccessToken();
-  const newTokenHash = await hashToken(newAccessToken);
-  const newTokenId = await generateOpaqueId(16);
-
-  await createAccessToken(c.env.DB, newTokenId, newTokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
-
-  // Generate new refresh token
-  const newRefreshToken = await generateRefreshToken();
-  const newRefreshTokenHash = await hashToken(newRefreshToken);
-
-  // Store new refresh token in KV with 7-day TTL
-  await c.env.SESSIONS.put(
-    `refresh:${newRefreshTokenHash}`,
-    JSON.stringify({
-      userId,
-      deviceId,
-      accessTokenId: newTokenId,
-      createdAt: Date.now(),
-    }),
-    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
-  );
-
-  // Access token expires in 1 hour
-  const expiresInMs = 60 * 60 * 1000;
-
-  return c.json({
-    access_token: newAccessToken,
-    refresh_token: newRefreshToken,
-    expires_in_ms: expiresInMs,
-  });
+  return c.json(await createSessionTokens(c.env, userId, deviceId, true));
 });
 
 // GET /_matrix/client/v3/register/available - Check if username is available
@@ -320,6 +306,7 @@ app.post('/_matrix/client/v3/register', async (c) => {
     device_id,
     initial_device_display_name,
     inhibit_login,
+    refresh_token: refreshTokenRequested,
     auth,
   } = body;
 
@@ -385,38 +372,13 @@ app.post('/_matrix/client/v3/register', async (c) => {
   const deviceId = device_id || await generateDeviceId();
   await createDevice(c.env.DB, userId, deviceId, initial_device_display_name);
 
-  const accessToken = await generateAccessToken();
-  const tokenHash = await hashToken(accessToken);
-  const tokenId = await generateOpaqueId(16);
-
-  await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId, Date.now() + 60 * 60 * 1000);
-
-  // Generate refresh token and store in KV with auto-expiration
-  const refreshToken = await generateRefreshToken();
-  const refreshTokenHash = await hashToken(refreshToken);
-
-  // Store refresh token in KV with 7-day TTL
-  await c.env.SESSIONS.put(
-    `refresh:${refreshTokenHash}`,
-    JSON.stringify({
-      userId,
-      deviceId,
-      accessTokenId: tokenId,
-      createdAt: Date.now(),
-    }),
-    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
-  );
-
-  // Access token expires in 1 hour
-  const expiresInMs = 60 * 60 * 1000;
+  const tokens = await createSessionTokens(c.env, userId, deviceId, refreshTokenRequested === true);
 
   return c.json({
     user_id: userId,
-    access_token: accessToken,
     device_id: deviceId,
     home_server: c.env.SERVER_NAME,
-    refresh_token: refreshToken,
-    expires_in_ms: expiresInMs,
+    ...tokens,
   });
 });
 

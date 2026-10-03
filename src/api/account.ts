@@ -8,6 +8,8 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { hashPassword, verifyPassword } from '../utils/crypto';
+import { requirePasswordConfirmation } from '../services/password-auth';
+import { isObject } from '../services/federation-events';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, deleteAllUserTokens } from '../services/database';
 import {
@@ -127,26 +129,10 @@ app.post('/_matrix/client/v3/account/deactivate', requireAuth(), async (c) => {
     body = {};
   }
 
+  if (!isObject(body)) return Errors.badJson().toResponse();
   const { erase = false, auth } = body;
-
-  // Require UIA for account deactivation
-  if (!auth || auth.type !== 'm.login.password') {
-    const sessionId = await generateOpaqueId(16);
-    return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
-    }, 401);
-  }
-
-  // Verify password
-  const storedHash = await getPasswordHash(db, userId);
-  if (storedHash && auth.password) {
-    const valid = await verifyPassword(auth.password, storedHash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-  }
+  const denied = await requirePasswordConfirmation(db, userId, auth);
+  if (denied) return denied;
 
   // Mark user as deactivated
   await db.prepare(`

@@ -7,15 +7,19 @@ import {
   getUserRooms,
   getRoomState,
   getEventsSince,
+  getRoomEvents,
   getLatestStreamPosition,
 } from '../services/database';
 import { getToDeviceMessages } from './to-device';
+import { parseSyncPosition, syncPosition, deviceKeyPosition, changedDeviceUsers } from '../services/sync-positions';
 import {
   getGlobalAccountData,
   getRoomAccountData,
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
+import { getStoredInviteState } from '../services/remote-invites';
+import { initialRoomHistory } from '../services/sync-history';
 
 // ============================================
 // Sync Filter Types and Helpers
@@ -176,78 +180,7 @@ async function getUnusedFallbackKeyTypes(
   return keys.results.map(row => row.algorithm);
 }
 
-// Helper to get device list changes (users whose keys have changed since last sync)
-async function getDeviceListChanges(
-  db: D1Database,
-  userId: string,
-  sincePosition: number
-): Promise<{ changed: string[]; left: string[] }> {
-  // Get users in shared rooms whose device keys have changed
-  // Note: We now include the user's own changes as well, because
-  // cross-signing signature uploads need to trigger key refresh
-  const otherUsersChanged = await db.prepare(`
-    SELECT DISTINCT dkc.user_id
-    FROM device_key_changes dkc
-    WHERE dkc.stream_position > ?
-      AND dkc.user_id != ?
-      AND EXISTS (
-        SELECT 1 FROM room_memberships rm1
-        JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-        WHERE rm1.user_id = ? AND rm1.membership = 'join'
-          AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
-      )
-  `).bind(sincePosition, userId, userId).all<{ user_id: string }>();
-
-  // Check if the user's own keys have changed (for cross-signing signatures)
-  const selfChanged = await db.prepare(`
-    SELECT COUNT(*) as count
-    FROM device_key_changes dkc
-    WHERE dkc.stream_position > ?
-      AND dkc.user_id = ?
-  `).bind(sincePosition, userId).first<{ count: number }>();
-
-  const changedUsers = otherUsersChanged.results.map(row => row.user_id);
-
-  // Include self in changed list if own keys updated (for cross-signing verification)
-  if (selfChanged && selfChanged.count > 0) {
-    changedUsers.push(userId);
-  }
-
-  // For left, we'd track users who left shared rooms, but for simplicity return empty for now
-  return {
-    changed: changedUsers,
-    left: [],
-  };
-}
-
 const app = new Hono<AppEnv>();
-
-// GET /_matrix/client/v3/sync - Sync with server
-// Parse composite sync token: "s{events}_td{to_device}" or legacy plain number
-function parseSyncToken(token: string | undefined): { events: number; toDevice: number } {
-  if (!token) {
-    return { events: 0, toDevice: 0 };
-  }
-
-  // Try composite format first: s84_td119
-  const match = token.match(/^s(\d+)_td(\d+)$/);
-  if (match) {
-    return { events: parseInt(match[1]), toDevice: parseInt(match[2]) };
-  }
-
-  // Legacy format: plain number (use for both streams for backwards compat)
-  const num = parseInt(token);
-  if (!isNaN(num)) {
-    return { events: num, toDevice: num };
-  }
-
-  return { events: 0, toDevice: 0 };
-}
-
-// Build composite sync token
-function buildSyncToken(eventsPos: number, toDevicePos: number): string {
-  return `s${eventsPos}_td${toDevicePos}`;
-}
 
 app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -265,10 +198,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Parse composite sync token (separate positions for events and to-device)
-  const { events: sincePosition, toDevice: sinceToDevice } = parseSyncToken(since);
+  const { events: sincePosition, toDevice: sinceToDevice, keys: sinceKeys } = parseSyncPosition(since);
 
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
+  let currentKeys = await deviceKeyPosition(c.env.DB);
 
   // Track to-device position for next_batch
   let currentToDevicePos = sinceToDevice;
@@ -320,22 +254,9 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
   }
 
-  // Get device list changes (users whose keys have changed since last sync)
-  if (sincePosition > 0) {
-    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sincePosition);
-    if (deviceListChanges.changed.length > 0 || deviceListChanges.left.length > 0) {
-      response.device_lists = deviceListChanges;
-    }
-  } else {
-    // For initial sync, include the user's own ID in device_lists.changed
-    // This tells Element X to fetch device keys immediately, which is important
-    // for cross-signing verification to work correctly after first login
-    response.device_lists = {
-      changed: [userId],
-      left: [],
-    };
-    console.log('[sync] Initial sync - including self in device_lists.changed to trigger key fetch');
-  }
+  const keyChanges = await changedDeviceUsers(c.env.DB, userId, sinceKeys, currentKeys);
+  if (!since && !keyChanges.includes(userId)) keyChanges.push(userId);
+  if (keyChanges.length) response.device_lists = {changed:keyChanges, left:[]};
 
   // Get global account data
   // For initial sync (no since token), get all account data
@@ -379,8 +300,27 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       },
     };
 
-    // Get events since last sync
-    const events = await getEventsSince(c.env.DB, roomId, sincePosition);
+    // Old clients may have cached an empty timeline at the federation join.
+    // Refresh it once when upgrading from the previous sync token format.
+    const initialTimeline = !since || !since.includes('_dk');
+    const timelineLimit = Math.min(100, Math.max(0, filter?.room?.timeline?.limit ?? 20));
+    const candidates = initialTimeline
+      ? (await getRoomEvents(c.env.DB, roomId, currentPosition + 1, timelineLimit + 1, 'b')).events.reverse()
+      : (await getEventsSince(c.env.DB, roomId, sincePosition, timelineLimit + 1, currentPosition, true)).reverse();
+    const events = timelineLimit ? candidates.slice(-timelineLimit) : [];
+    let limited = candidates.length > events.length;
+    let prevBatch: string | undefined;
+    if (events.length) {
+      const oldest = await c.env.DB.prepare('SELECT stream_ordering FROM events WHERE event_id = ?')
+        .bind(events[0].event_id).first<{stream_ordering:number}>();
+      prevBatch = `s${oldest!.stream_ordering}`;
+      if (initialTimeline && !limited) {
+        const history = await initialRoomHistory(c.env, roomId, userId, events[0].event_id, timelineLimit - events.length);
+        events.unshift(...history.events);
+        limited = history.limited;
+        if (history.fetched) prevBatch = history.cursor;
+      }
+    }
 
     // Separate state and timeline events
     let stateEvents: any[] = [];
@@ -398,7 +338,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         unsigned: event.unsigned,
       };
 
-      if (event.state_key !== undefined) {
+      if (event.state_key !== undefined && candidates.some(candidate => candidate.event_id === event.event_id)) {
         // State event - include in both state and timeline
         stateEvents.push(clientEvent);
       }
@@ -406,7 +346,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     // Include full state if requested or initial sync
-    if (fullState || sincePosition === 0) {
+    if (fullState || initialTimeline || limited) {
       const state = await getRoomState(c.env.DB, roomId);
       for (const event of state) {
         const clientEvent = {
@@ -431,7 +371,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     joinedRoom.state!.events = stateEvents;
     joinedRoom.timeline!.events = timelineEvents;
-    joinedRoom.timeline!.prev_batch = sincePosition.toString();
+    joinedRoom.timeline!.prev_batch = prevBatch;
+    joinedRoom.timeline!.limited = limited;
 
     // Get room-level account data
     let roomAccountData = await getRoomAccountData(
@@ -486,6 +427,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       content: event.content,
       sender: event.sender,
     }));
+
+    strippedState = await getStoredInviteState(c.env.DB, roomId, userId) ?? strippedState;
 
     // Apply state filter to invited room state
     strippedState = applyEventFilter(strippedState, filter?.room?.state);
@@ -547,7 +490,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;
   const hasToDevice = response.to_device!.events.length > 0;
   const hasAccountData = response.account_data!.events.length > 0;
-  const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData;
+  const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData || keyChanges.length > 0;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
@@ -564,7 +507,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeout: waitTimeout }),
+      body: JSON.stringify({ timeout: waitTimeout, userId, deviceId, toDeviceSince: String(sinceToDevice) }),
     }));
 
     const waitResult = await waitResponse.json() as { hasEvents: boolean };
@@ -572,10 +515,16 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     if (waitResult.hasEvents) {
       console.log('[sync] Woken up early - events arrived for', userId);
-      // New events arrived - return empty response with SAME next_batch
-      // Client will immediately sync again and get the new events
-      // We intentionally do NOT advance next_batch here, so the client
-      // re-syncs from the same position and actually sees the events
+      if (deviceId) {
+        const updated = await getToDeviceMessages(c.env.DB, userId, deviceId, String(sinceToDevice));
+        response.to_device!.events = updated.events;
+        currentToDevicePos = Number(updated.nextBatch);
+      }
+      currentKeys = await deviceKeyPosition(c.env.DB);
+      const changed = await changedDeviceUsers(c.env.DB, userId, sinceKeys, currentKeys);
+      if (changed.length) response.device_lists = {changed, left:[]};
+      // Room changes are read on the next request; their stream position stays
+      // at the snapshot captured before waiting.
     }
   } else if (timeout > 0 && sincePosition > 0) {
     console.log('[sync] Skipping DO wait for', userId, '- hasChanges:', hasChanges,
@@ -585,7 +534,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Build composite next_batch token with separate positions for each stream
   if (!response.next_batch) {
-    response.next_batch = buildSyncToken(currentPosition, currentToDevicePos);
+    response.next_batch = syncPosition(currentPosition, currentToDevicePos, currentKeys);
   }
 
   return c.json(response);

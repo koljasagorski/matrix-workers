@@ -7,7 +7,7 @@ import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { hashToken, verifyPassword } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
-import { createDevice, createAccessToken, getUserById } from '../services/database';
+import { createDevice, createAccessToken, getUserById, getUserByTokenHash } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -68,14 +68,6 @@ function base64UrlEncode(data: Uint8Array): string {
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
-}
-
-// Base64URL decode (for future JWT parsing)
-function base64UrlDecode(str: string): Uint8Array {
-  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
-  const binary = atob(padded);
-  return Uint8Array.from(binary, c => c.charCodeAt(0));
 }
 
 // Verify PKCE code challenge
@@ -239,7 +231,8 @@ app.get('/oauth/authorize', async (c) => {
 // POST /oauth/authorize - Handle login form submission
 app.post('/oauth/authorize', async (c) => {
   const formData = await c.req.formData();
-  const username = formData.get('username') as string;
+  const usernameValue = formData.get('username');
+  const username = typeof usernameValue === 'string' ? usernameValue.trim() : '';
   const password = formData.get('password') as string;
   const authRequestId = formData.get('auth_request_id') as string;
 
@@ -257,7 +250,8 @@ app.post('/oauth/authorize', async (c) => {
   await c.env.SESSIONS.delete(`oauth_auth_request:${authRequestId}`);
 
   // Authenticate user
-  const userId = formatUserId(username, c.env.SERVER_NAME);
+  // Full Matrix IDs already contain the sigil and server name.
+  const userId = username.startsWith('@') ? username : formatUserId(username, c.env.SERVER_NAME);
   const user = await c.env.DB.prepare(
     'SELECT user_id, password_hash FROM users WHERE user_id = ? AND is_deactivated = 0'
   ).bind(userId).first<{ user_id: string; password_hash: string | null }>();
@@ -442,7 +436,7 @@ app.post('/oauth/token', async (c) => {
     // Create device and access token in database
     await createDevice(c.env.DB, authCode.user_id, deviceId, `OAuth Client (${client.client_name})`);
     const tokenHash = await hashToken(accessToken);
-    await createAccessToken(c.env.DB, tokenId, tokenHash, authCode.user_id, deviceId);
+    await createAccessToken(c.env.DB, tokenId, tokenHash, authCode.user_id, deviceId, Date.now() + 86400000);
 
     // Store refresh token
     const oauthToken: OAuthToken = {
@@ -490,6 +484,12 @@ app.post('/oauth/token', async (c) => {
       return c.json({ error: 'invalid_grant', error_description: 'Token was not issued to this client' }, 400);
     }
 
+    // The access session may have expired, but logout/device revocation must prevent refresh.
+    const session = await c.env.DB.prepare(`SELECT a.token_id FROM access_tokens a JOIN users u ON u.user_id=a.user_id
+      WHERE a.token_id=? AND a.token_hash=? AND a.user_id=? AND u.is_deactivated=0`)
+      .bind(tokenData.token_id, tokenData.access_token_hash, tokenData.user_id).first();
+    if (!session) return c.json({ error: 'invalid_grant', error_description: 'Session was revoked' }, 400);
+
     // Generate new tokens
     const newAccessToken = await generateAccessToken();
     const newRefreshToken = generateRandomString(32);
@@ -497,7 +497,11 @@ app.post('/oauth/token', async (c) => {
 
     // Update access token in database
     const newTokenHash = await hashToken(newAccessToken);
-    await createAccessToken(c.env.DB, newTokenId, newTokenHash, tokenData.user_id, tokenData.device_id);
+    // Atomic rotation: only one concurrent refresh can replace this session.
+    const rotated = await c.env.DB.prepare(`UPDATE access_tokens SET token_id=?,token_hash=?,expires_at=?
+      WHERE token_id=? AND token_hash=? RETURNING token_id`)
+      .bind(newTokenId, newTokenHash, Date.now()+86400000, tokenData.token_id, tokenData.access_token_hash).first();
+    if (!rotated) return c.json({ error: 'invalid_grant', error_description: 'Refresh token already used' }, 400);
 
     // Delete old refresh token and create new one
     await c.env.SESSIONS.delete(`oauth_refresh:${refreshToken}`);
@@ -631,40 +635,13 @@ app.post('/oauth/introspect', async (c) => {
     return c.json({ error: 'invalid_request', error_description: 'token is required' }, 400);
   }
 
-  // Check if it looks like a JWT (has 3 base64url-encoded parts)
-  const jwtParts = token.split('.');
-  if (jwtParts.length === 3) {
-    try {
-      // Decode the payload (second part) to extract claims
-      const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(jwtParts[1])));
-      
-      // Check if expired
-      if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-        return c.json({ active: false });
-      }
-      
-      return c.json({
-        active: true,
-        sub: payload.sub,
-        client_id: payload.client_id || payload.azp,
-        token_type: 'Bearer',
-        exp: payload.exp,
-        iat: payload.iat,
-        scope: payload.scope,
-        iss: payload.iss,
-      });
-    } catch {
-      // Not a valid JWT, fall through to database check
-    }
-  }
-
   // Check if it's an access token in the database
   const tokenHash = await hashToken(token);
   const accessToken = await c.env.DB.prepare(
     'SELECT user_id, device_id, created_at FROM access_tokens WHERE token_hash = ?'
   ).bind(tokenHash).first<{ user_id: string; device_id: string; created_at: number }>();
 
-  if (accessToken) {
+  if (accessToken && await getUserByTokenHash(c.env.DB, tokenHash)) {
     return c.json({
       active: true,
       sub: accessToken.user_id,
@@ -814,8 +791,8 @@ function generateLoginPage(clientName: string, authRequestId: string, serverName
       <input type="hidden" name="auth_request_id" value="${escapeHtml(authRequestId)}">
       
       <div class="form-group">
-        <label for="username">Username</label>
-        <input type="text" id="username" name="username" placeholder="Enter your username" required autocomplete="username" autofocus>
+        <label for="username">Username or Matrix ID</label>
+        <input type="text" id="username" name="username" placeholder="username or @username:${escapeHtml(serverName)}" required autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
       </div>
       
       <div class="form-group">
@@ -924,7 +901,7 @@ app.post('/oauth/authorize/uia', async (c) => {
 
   // Verify the credentials
   const db = c.env.DB;
-  const userId = formatUserId(username, serverName);
+  const userId = username.startsWith('@') ? username.trim() : formatUserId(username.trim(), serverName);
   
   // Check user exists
   const user = await getUserById(db, userId);
@@ -945,33 +922,8 @@ app.post('/oauth/authorize/uia', async (c) => {
   `).bind(userId).first<{ password_hash: string }>();
 
   if (!passwordHash?.password_hash) {
-    // User might be OIDC-only - check if they have an IdP link
-    const idpLink = await db.prepare(`
-      SELECT COUNT(*) as count FROM idp_user_links WHERE user_id = ?
-    `).bind(userId).first<{ count: number }>();
-
-    if ((idpLink?.count || 0) > 0) {
-      // OIDC user - just verify the user ID matches the session
-      if (userId !== session.user_id) {
-        return c.html(generateUiaApprovalPage(
-          sessionId,
-          session.user_id,
-          'Reset Encryption Keys',
-          'Please enter your credentials to approve this request.',
-          serverName,
-          'You must approve with the same account that started this request.'
-        ));
-      }
-    } else {
-      return c.html(generateUiaApprovalPage(
-        sessionId,
-        session.user_id,
-        'Reset Encryption Keys',
-        'Please enter your credentials to approve this request.',
-        serverName,
-        'Invalid username or password.'
-      ));
-    }
+    return c.html(generateUiaApprovalPage(sessionId, session.user_id, 'Reset Encryption Keys',
+      'Password reauthentication is required.', serverName, 'This account cannot use password reauthentication.'), 403);
   } else {
     // Verify password
     const valid = await verifyPassword(password, passwordHash.password_hash);

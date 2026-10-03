@@ -2,9 +2,13 @@
 // Implements both the original sliding sync and simplified sliding sync
 
 import { Hono, type Context } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
+import { initialRoomHistory } from '../services/sync-history';
 import { Errors } from '../utils/errors';
+import { getStoredInviteState } from '../services/remote-invites';
 import { requireAuth } from '../middleware/auth';
+import { getToDeviceMessages } from './to-device';
+import { parseSyncPosition, deviceKeyPosition, changedDeviceUsers } from '../services/sync-positions';
 import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
@@ -126,6 +130,8 @@ interface RoomResult {
   canonical_alias?: string;
   heroes?: StrippedHero[];
   initial?: boolean;
+  unstable_expanded_timeline?: boolean;
+  expanded_timeline?: boolean;
   required_state?: any[];
   timeline?: any[];
   prev_batch?: string;
@@ -185,6 +191,10 @@ interface ConnectionState {
   roomStates: Record<string, {
     lastStreamOrdering: number;  // Last stream_ordering sent for this room
     sentState: boolean;
+    timelineLimit?: number;
+    historyVersion?: number;
+    requiredState?: [string, string][];
+    membership?: string;
   }>;
   listStates: Record<string, {
     roomIds: string[];
@@ -367,7 +377,7 @@ async function getUserRooms(
 // Get room data for response
 // OPTIMIZED: Uses DB.batch() to fetch all room metadata in a single network call
 async function getRoomData(
-  db: D1Database,
+  env: Env,
   roomId: string,
   userId: string,
   config: {
@@ -375,8 +385,10 @@ async function getRoomData(
     timelineLimit?: number;
     initial?: boolean;
     sinceStreamOrdering?: number;  // Only return events after this stream position
+    liveAfter?: number;  // Count only new events when expanding a timeline
   }
 ): Promise<RoomResult & { maxStreamOrdering?: number }> {
+  const db = env.DB;
   const result: RoomResult & { maxStreamOrdering?: number } = {
     membership: 'join',  // MSC4186: explicitly indicate this is a joined room
   };
@@ -538,7 +550,7 @@ async function getRoomData(
   if (config.timelineLimit && config.timelineLimit > 0) {
     let timelineQuery: string;
     let timelineParams: (string | number)[];
-    const isIncremental = config.sinceStreamOrdering !== undefined && config.sinceStreamOrdering > 0;
+    const isIncremental = config.sinceStreamOrdering !== undefined;
 
     // For incremental sync (sinceStreamOrdering provided), only get new events
     // For initial sync, get the last N events
@@ -548,7 +560,7 @@ async function getRoomData(
     if (isIncremental) {
       // Incremental: get events since the last sync position
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, prev_events
         FROM events
         WHERE room_id = ? AND stream_ordering > ?
         ORDER BY stream_ordering ASC
@@ -558,9 +570,9 @@ async function getRoomData(
     } else {
       // Initial: get the most recent events
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, prev_events
         FROM events
-        WHERE room_id = ?
+        WHERE room_id = ? AND stream_ordering IS NOT NULL
         ORDER BY stream_ordering DESC
         LIMIT ?
       `;
@@ -586,7 +598,7 @@ async function getRoomData(
           sender: event.sender,
           origin_server_ts: event.origin_server_ts,
           content: JSON.parse(event.content),
-          state_key: event.state_key || undefined,
+          state_key: event.state_key ?? undefined,
           unsigned: event.unsigned ? JSON.parse(event.unsigned) : undefined,
         };
       } catch {
@@ -596,7 +608,7 @@ async function getRoomData(
           sender: event.sender,
           origin_server_ts: event.origin_server_ts,
           content: {},
-          state_key: event.state_key || undefined,
+          state_key: event.state_key ?? undefined,
         };
       }
     });
@@ -608,9 +620,8 @@ async function getRoomData(
     }
 
     // Set num_live for incremental syncs (tells client how many new events)
-    if (isIncremental) {
-      result.num_live = result.timeline.length;
-    }
+    result.num_live = config.initial ? 0 : eventsToProcess.filter(event =>
+      event.stream_ordering > (config.liveAfter ?? config.sinceStreamOrdering ?? 0)).length;
 
     // Get prev_batch for pagination (only useful for initial sync really)
     if (eventsToProcess.length > 0) {
@@ -622,6 +633,17 @@ async function getRoomData(
     // For incremental syncs: only true if there are actually more new events
     // For initial syncs: true if there are more historical events
     result.limited = hasMoreEvents;
+    if (!isIncremental && !hasMoreEvents && eventsToProcess.length) {
+      const history = await initialRoomHistory(env, roomId, userId, eventsToProcess[0].event_id,
+        config.timelineLimit - result.timeline.length);
+      result.timeline.unshift(...history.events.map(event => ({
+        type: event.type, event_id: event.event_id, sender: event.sender,
+        origin_server_ts: event.origin_server_ts, content: event.content,
+        state_key: event.state_key, unsigned: event.unsigned,
+      })));
+      result.limited = history.limited;
+      if (history.fetched) result.prev_batch = history.cursor;
+    }
   }
 
   // Get notification and highlight counts using push rule evaluation
@@ -697,6 +719,8 @@ async function getInviteRoomData(
     }
   }
 
+  const storedInvite = await getStoredInviteState(db, roomId, userId);
+  if (storedInvite) inviteState.splice(0, inviteState.length, ...storedInvite);
   result.invite_state = inviteState;
 
   // Extract name from state if available
@@ -746,6 +770,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
 
   // Get current stream position from database
   const currentStreamPos = await getCurrentStreamPosition(db);
+  const currentKeys = await deviceKeyPosition(db);
 
   // Get or create connection state
   let connectionState: ConnectionState | null;
@@ -803,7 +828,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
   connectionState.lastAccess = Date.now();
 
   const response: SlidingSyncResponse = {
-    pos: String(currentStreamPos),
+    pos: `${currentStreamPos}_dk${currentKeys}`,
     lists: {},
     rooms: {},
     extensions: {},
@@ -878,7 +903,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         }
 
         // For joined rooms, get full room data
-        const roomData = await getRoomData(db, roomInfo.roomId, userId, {
+        const roomData = await getRoomData(c.env, roomInfo.roomId, userId, {
           requiredState: listConfig.required_state,
           timelineLimit: listConfig.timeline_limit || 10,
           initial: isInitialRoom,
@@ -975,7 +1000,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       }
 
       // For joined rooms, get full room data
-      const roomData = await getRoomData(db, roomId, userId, {
+      const roomData = await getRoomData(c.env, roomId, userId, {
         requiredState: subscription.required_state,
         timelineLimit: subscription.timeline_limit || 10,
         initial: isInitialRoom,
@@ -1098,44 +1123,9 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
-      const deviceListChanged: string[] = [];
-
-      if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
-        const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
-        const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
-        const deviceIds = await deviceIdsResp.json() as string[];
-
-        // Also check for cross-signing keys
-        const crossSigningResp = await userKeysDO.fetch(new Request('http://internal/cross-signing/get'));
-        const crossSigningKeys = await crossSigningResp.json() as Record<string, any>;
-
-        if (deviceIds.length > 0 || Object.keys(crossSigningKeys).length > 0) {
-          deviceListChanged.push(userId);
-        }
-      } else {
-        const changes = await db.prepare(`
-          SELECT DISTINCT dkc.user_id
-          FROM device_key_changes dkc
-          WHERE dkc.stream_position > ?
-            AND (
-              dkc.user_id = ?
-              OR EXISTS (
-                SELECT 1 FROM room_memberships rm1
-                JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-                WHERE rm1.user_id = ? AND rm1.membership = 'join'
-                  AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
-              )
-            )
-        `).bind(sincePos, userId, userId).all();
-        deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
-      }
+      const keySince = parseSyncPosition(posToken).keys;
+      const deviceListChanged = await changedDeviceUsers(db, userId, keySince, currentKeys);
+      if (!posToken && !deviceListChanged.includes(userId)) deviceListChanged.push(userId);
 
       response.extensions.e2ee = {
         device_lists: {
@@ -1368,7 +1358,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     return Errors.badJson().toResponse();
   }
 
-  const connId = body.conn_id || 'default';
+  const connId = JSON.stringify([c.get('deviceId') ?? '', body.conn_id || 'default']);
 
   // NSE Detection - log potential NSE requests
   const nseDetection = detectNSERequest(userAgent, body);
@@ -1393,6 +1383,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
 
   // Get current stream position from database
   const currentStreamPos = await getCurrentStreamPosition(db);
+  const currentKeys = await deviceKeyPosition(db);
 
   // Get or create connection state
   let connectionState: ConnectionState | null;
@@ -1453,7 +1444,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }
   }
 
-  const isInitialSync = !posToken || sincePos === 0;
+  const isInitialSync = !posToken;
+  if (isInitialSync) connectionState = null;
 
   if (!connectionState) {
     connectionState = {
@@ -1482,237 +1474,78 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     response.txn_id = body.txn_id;
   }
 
-  // Track max stream ordering we process
-  let maxStreamOrdering = sincePos;
-
-  // Process lists (MSC4186 uses single 'range' instead of 'ranges')
-  if (body.lists) {
-    for (const [listKey, listConfig] of Object.entries(body.lists)) {
-      const rooms = await getUserRooms(db, userId, listConfig.filters, listConfig.sort);
-
-      let startIndex = 0;
-      let endIndex = rooms.length - 1;
-
-      if (listConfig.range) {
-        startIndex = listConfig.range[0];
-        endIndex = Math.min(listConfig.range[1], rooms.length - 1);
-      } else if (listConfig.ranges && listConfig.ranges.length > 0) {
-        startIndex = listConfig.ranges[0][0];
-        endIndex = Math.min(listConfig.ranges[0][1], rooms.length - 1);
-      }
-
-      const roomsInRange = rooms.slice(startIndex, endIndex + 1);
-      const roomIds = roomsInRange.map(r => r.roomId);
-
-      // Check if the list has changed since last sync
-      const previousListState = connectionState.listStates[listKey];
-      const listChanged = !previousListState ||
-        previousListState.count !== rooms.length ||
-        JSON.stringify(previousListState.roomIds) !== JSON.stringify(roomIds);
-
-      // Only include ops if the list changed (or it's an initial sync)
-      if (listChanged) {
-        hasChanges = true; // Mark that we have actual changes
-        response.lists[listKey] = {
-          count: rooms.length,
-          ops: [{
-            op: 'SYNC',
-            range: [startIndex, endIndex],
-            room_ids: roomIds,
-          }],
-        };
-      } else {
-        // List unchanged - just report count with no ops
-        response.lists[listKey] = {
-          count: rooms.length,
-        };
-      }
-
-      for (const roomInfo of roomsInRange) {
-        const roomState = connectionState.roomStates[roomInfo.roomId];
-        const isInitialRoom = !roomState?.sentState;
-        const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || sincePos);
-
-        // Handle invited rooms differently - they get invite_state not timeline
-        // Always include invited room data (small payload) so client doesn't lose invites on reconnect
-        if (roomInfo.membership === 'invite') {
-          const roomData = await getInviteRoomData(db, roomInfo.roomId, userId);
-          hasChanges = true; // Mark that we have actual changes
-          response.rooms[roomInfo.roomId] = roomData;
-          connectionState.roomStates[roomInfo.roomId] = {
-            sentState: true,
-            lastStreamOrdering: roomSincePos,
-          };
-          continue;
-        }
-
-        // For joined rooms, get full room data
-        const roomData = await getRoomData(db, roomInfo.roomId, userId, {
-          requiredState: listConfig.required_state,
-          timelineLimit: listConfig.timeline_limit || 10,
-          initial: isInitialRoom,
-          sinceStreamOrdering: isInitialRoom ? undefined : roomSincePos,
-        });
-
-        // Check if notification count changed (for marking rooms as read)
-        const hasPrevCount = roomInfo.roomId in (connectionState.roomNotificationCounts || {});
-        const prevNotificationCount = connectionState.roomNotificationCounts?.[roomInfo.roomId] ?? 0;
-        const currentNotificationCount = roomData.notification_count ?? 0;
-        const notificationCountChanged = hasPrevCount && currentNotificationCount !== prevNotificationCount;
-
-        // Check if m.fully_read marker changed (Element X uses this for encrypted rooms)
-        const fullyReadResult = await db.prepare(`
-          SELECT content FROM account_data
-          WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'
-        `).bind(userId, roomInfo.roomId).first<{ content: string }>();
-        let currentFullyRead = '';
-        if (fullyReadResult) {
-          try {
-            currentFullyRead = JSON.parse(fullyReadResult.content).event_id || '';
-          } catch { /* ignore */ }
-        }
-        const prevFullyRead = connectionState.roomFullyReadMarkers?.[roomInfo.roomId] ?? '';
-        const fullyReadChanged = currentFullyRead !== prevFullyRead && currentFullyRead !== '';
-
-        // Track if this is the first time we're sending this room as "read" (notification_count = 0)
-        // This ensures Element X receives the room with 0 unread count at least once
-        const firstTimeRead = currentNotificationCount === 0
-          && !connectionState.roomSentAsRead?.[roomInfo.roomId];
-
-        // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
-        if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
-          hasChanges = true; // Mark that we have actual changes
-          response.rooms[roomInfo.roomId] = roomData;
-
-          // Update tracked state
-          connectionState.roomNotificationCounts = connectionState.roomNotificationCounts || {};
-          connectionState.roomNotificationCounts[roomInfo.roomId] = currentNotificationCount;
-          connectionState.roomFullyReadMarkers = connectionState.roomFullyReadMarkers || {};
-          connectionState.roomFullyReadMarkers[roomInfo.roomId] = currentFullyRead;
-
-          // Track room read status - set when read, clear when unread
-          connectionState.roomSentAsRead = connectionState.roomSentAsRead || {};
-          if (currentNotificationCount === 0) {
-            connectionState.roomSentAsRead[roomInfo.roomId] = true;
-          } else {
-            // Clear flag when there are unread messages so room will be included again when read
-            delete connectionState.roomSentAsRead[roomInfo.roomId];
-          }
-        }
-
-        // Update room state tracking
-        const newStreamOrdering = roomData.maxStreamOrdering || roomSincePos;
-        connectionState.roomStates[roomInfo.roomId] = {
-          sentState: true,
-          lastStreamOrdering: newStreamOrdering,
-        };
-
-        if (newStreamOrdering > maxStreamOrdering) {
-          maxStreamOrdering = newStreamOrdering;
-        }
-      }
-
-      connectionState.listStates[listKey] = {
-        roomIds,
-        count: rooms.length,
-      };
-    }
+  // A room may match several lists and an explicit subscription. Merge the
+  // requests first, then read/advance its cursor exactly once. Otherwise the
+  // subscription overwrites the list's freshly read timeline with an empty one.
+  const selected = new Map<string, { membership: string; timelineLimit: number; requiredState: [string, string][] }>();
+  function selectRoom(roomId: string, membership: string, config: RoomSubscription) {
+    const previous = selected.get(roomId);
+    const requiredState = [...(previous?.requiredState ?? []), ...(config.required_state ?? [])];
+    selected.set(roomId, {
+      membership,
+      timelineLimit: Math.max(previous?.timelineLimit ?? 0, Math.min(100, Math.max(0, config.timeline_limit ?? 10))),
+      requiredState: [...new Map(requiredState.map(pair => [JSON.stringify(pair), pair])).values()],
+    });
   }
-
-  // Process room subscriptions
-  if (body.room_subscriptions) {
-    for (const [roomId, subscription] of Object.entries(body.room_subscriptions)) {
-      const membershipResult = await db.prepare(`
-        SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
-      `).bind(roomId, userId).first() as { membership: string } | null;
-
-      if (!membershipResult) continue;
-
-      const roomState = connectionState.roomStates[roomId];
-      const isInitialRoom = !roomState?.sentState;
-      const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || sincePos);
-
-      // Handle invited rooms differently - they get invite_state not timeline
-      // Always include invited room data (small payload) so client doesn't lose invites on reconnect
-      if (membershipResult.membership === 'invite') {
-        const roomData = await getInviteRoomData(db, roomId, userId);
-        hasChanges = true; // Mark that we have actual changes
-        response.rooms[roomId] = roomData;
-        connectionState.roomStates[roomId] = {
-          sentState: true,
-          lastStreamOrdering: roomSincePos,
-        };
-        continue;
-      }
-
-      // For joined rooms, get full room data
-      const roomData = await getRoomData(db, roomId, userId, {
-        requiredState: subscription.required_state,
-        timelineLimit: subscription.timeline_limit || 10,
-        initial: isInitialRoom,
-        sinceStreamOrdering: isInitialRoom ? undefined : roomSincePos,
-      });
-
-      // Check if notification count changed (for marking rooms as read)
-      const hasPrevCount = roomId in (connectionState.roomNotificationCounts || {});
-      const prevNotificationCount = connectionState.roomNotificationCounts?.[roomId] ?? 0;
-      const currentNotificationCount = roomData.notification_count ?? 0;
-      const notificationCountChanged = hasPrevCount && currentNotificationCount !== prevNotificationCount;
-
-      // Check if m.fully_read marker changed (Element X uses this for encrypted rooms)
-      const fullyReadResult = await db.prepare(`
-        SELECT content FROM account_data
-        WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'
-      `).bind(userId, roomId).first<{ content: string }>();
-      let currentFullyRead = '';
-      if (fullyReadResult) {
-        try {
-          currentFullyRead = JSON.parse(fullyReadResult.content).event_id || '';
-        } catch { /* ignore */ }
-      }
-      const prevFullyRead = connectionState.roomFullyReadMarkers?.[roomId] ?? '';
-      const fullyReadChanged = currentFullyRead !== prevFullyRead && currentFullyRead !== '';
-
-      // Track if this is the first time we're sending this room as "read" (notification_count = 0)
-      const firstTimeRead = currentNotificationCount === 0
-        && !connectionState.roomSentAsRead?.[roomId];
-
-      // For room subscriptions, ALWAYS include room data because client explicitly requested it
-      // This is different from list-based sync - room subscriptions mean "give me this room's data"
-      // Element X needs this when opening a room to display timeline and state
+  for (const [listKey, listConfig] of Object.entries(body.lists ?? {})) {
+    const rooms = await getUserRooms(db, userId, listConfig.filters, listConfig.sort);
+    const range = listConfig.range ?? listConfig.ranges?.[0] ?? [0, rooms.length - 1];
+    const startIndex = Math.max(0, range[0]);
+    const endIndex = Math.min(range[1], rooms.length - 1);
+    const roomsInRange = rooms.slice(startIndex, endIndex + 1);
+    const roomIds = roomsInRange.map(room => room.roomId);
+    const previous = connectionState.listStates[listKey];
+    const changed = !previous || previous.count !== rooms.length || JSON.stringify(previous.roomIds) !== JSON.stringify(roomIds);
+    response.lists[listKey] = { count: rooms.length };
+    if (changed) {
       hasChanges = true;
-      response.rooms[roomId] = roomData;
-
-      // Also track for legacy reasons (notification changes, read status)
-      if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
-        // Already included above, but update tracking state
-
-        // Update tracked state
-        connectionState.roomNotificationCounts = connectionState.roomNotificationCounts || {};
-        connectionState.roomNotificationCounts[roomId] = currentNotificationCount;
-        connectionState.roomFullyReadMarkers = connectionState.roomFullyReadMarkers || {};
-        connectionState.roomFullyReadMarkers[roomId] = currentFullyRead;
-
-        // Track room read status - set when read, clear when unread
-        connectionState.roomSentAsRead = connectionState.roomSentAsRead || {};
-        if (currentNotificationCount === 0) {
-          connectionState.roomSentAsRead[roomId] = true;
-        } else {
-          // Clear flag when there are unread messages so room will be included again when read
-          delete connectionState.roomSentAsRead[roomId];
-        }
-      }
-
-      const newStreamOrdering = roomData.maxStreamOrdering || roomSincePos;
-      connectionState.roomStates[roomId] = {
-        sentState: true,
-        lastStreamOrdering: newStreamOrdering,
-      };
-
-      if (newStreamOrdering > maxStreamOrdering) {
-        maxStreamOrdering = newStreamOrdering;
-      }
+      if (endIndex >= startIndex) response.lists[listKey].ops = [{ op: 'SYNC', range: [startIndex, endIndex], room_ids: roomIds }];
     }
+    for (const room of roomsInRange) selectRoom(room.roomId, room.membership, listConfig);
+    connectionState.listStates[listKey] = { roomIds, count: rooms.length };
+  }
+  for (const [roomId, subscription] of Object.entries(body.room_subscriptions ?? {})) {
+    const membership = await db.prepare('SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?')
+      .bind(roomId, userId).first<{ membership: string }>();
+    if (membership && ['join', 'invite'].includes(membership.membership)) selectRoom(roomId, membership.membership, subscription);
+  }
+  for (const [roomId, config] of selected) {
+    const previous = connectionState.roomStates[roomId];
+    const initial = !previous?.sentState || previous.membership === 'invite';
+    const since = previous?.lastStreamOrdering ?? 0;
+    if (config.membership === 'invite') {
+      response.rooms[roomId] = await getInviteRoomData(db, roomId, userId); hasChanges = true;
+      connectionState.roomStates[roomId] = { sentState: true, lastStreamOrdering: since, membership: 'invite' };
+      continue;
+    }
+    const expanded = !initial && (config.timelineLimit > (previous.timelineLimit ?? 0) || previous.historyVersion !== 1);
+    const stateChanged = JSON.stringify(config.requiredState) !== JSON.stringify(previous?.requiredState);
+    const roomData = await getRoomData(c.env, roomId, userId, {
+      requiredState: config.requiredState, timelineLimit: config.timelineLimit, initial,
+      sinceStreamOrdering: initial || expanded ? undefined : since,
+      liveAfter: since,
+    });
+    if (expanded) {
+      roomData.unstable_expanded_timeline = true;
+      roomData.expanded_timeline = true;
+    }
+    const count = roomData.notification_count ?? 0;
+    const countChanged = connectionState.roomNotificationCounts?.[roomId] !== count;
+    const marker = await db.prepare("SELECT content FROM account_data WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'")
+      .bind(userId, roomId).first<{ content: string }>();
+    const fullyRead = marker?.content ?? '';
+    const readChanged = connectionState.roomFullyReadMarkers?.[roomId] !== fullyRead;
+    if (initial || expanded || stateChanged || roomData.timeline?.length || countChanged || readChanged) {
+      hasChanges = true;
+      const { maxStreamOrdering: _, ...clientData } = roomData;
+      response.rooms[roomId] = clientData;
+    }
+    (connectionState.roomNotificationCounts ??= {})[roomId] = count;
+    (connectionState.roomFullyReadMarkers ??= {})[roomId] = fullyRead;
+    connectionState.roomStates[roomId] = {
+      sentState: true, lastStreamOrdering: roomData.maxStreamOrdering ?? since, membership: config.membership,
+      timelineLimit: config.timelineLimit, requiredState: config.requiredState, historyVersion: 1,
+    };
   }
 
   // Handle extensions
@@ -1776,44 +1609,9 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
-      const deviceListChanged: string[] = [];
-
-      if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
-        const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
-        const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
-        const deviceIds = await deviceIdsResp.json() as string[];
-
-        // Also check for cross-signing keys
-        const crossSigningResp = await userKeysDO.fetch(new Request('http://internal/cross-signing/get'));
-        const crossSigningKeys = await crossSigningResp.json() as Record<string, any>;
-
-        if (deviceIds.length > 0 || Object.keys(crossSigningKeys).length > 0) {
-          deviceListChanged.push(userId);
-        }
-      } else {
-        const changes = await db.prepare(`
-          SELECT DISTINCT dkc.user_id
-          FROM device_key_changes dkc
-          WHERE dkc.stream_position > ?
-            AND (
-              dkc.user_id = ?
-              OR EXISTS (
-                SELECT 1 FROM room_memberships rm1
-                JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-                WHERE rm1.user_id = ? AND rm1.membership = 'join'
-                  AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
-              )
-            )
-        `).bind(sincePos, userId, userId).all();
-        deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
-      }
+      const keySince = parseSyncPosition(posToken).keys;
+      const deviceListChanged = await changedDeviceUsers(db, userId, keySince, currentKeys);
+      if (!posToken && !deviceListChanged.includes(userId)) deviceListChanged.push(userId);
 
       response.extensions.e2ee = {
         device_lists: { changed: deviceListChanged, left: [] },
@@ -2041,7 +1839,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Always advance position to prevent client re-sync loops
   // Previously we only set pos when hasChanges, but this caused clients to receive
   // the same pos twice and immediately re-sync, thinking it was stale
-  response.pos = String(currentStreamPos);
+  response.pos = `${currentStreamPos}_dk${currentKeys}`;
   connectionState.pos = currentStreamPos;
 
   // Mark initial sync as complete so ephemeral fallback doesn't run again on reconnects
@@ -2064,6 +1862,11 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     // But client may experience duplicated ephemeral data
   }
 
+  // Verification and encryption-key messages are changes even when no room
+  // timeline changed. Never hold a ready device message for the poll timeout.
+  hasChanges ||= (response.extensions.to_device?.events.length ?? 0) > 0 ||
+    (response.extensions.e2ee?.device_lists?.changed.length ?? 0) > 0;
+
   // Long-polling: if no changes and timeout > 0, wait for events via Durable Object
   // The SyncDurableObject will wake us up when events arrive for this user
   // Per MSC3575/MSC4186, server should wait up to timeout ms for new events
@@ -2075,14 +1878,24 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timeout }),
+        body: JSON.stringify({ timeout, userId, deviceId: body.extensions?.to_device ? c.get('deviceId') : undefined,
+          toDeviceSince: body.extensions?.to_device?.since }),
       }));
       const waitResult = await waitResponse.json() as { hasEvents: boolean };
 
       if (waitResult.hasEvents) {
         console.log('[sliding-sync] Woken up early - events arrived');
-        // Events arrived while waiting - return immediately so client makes new request
-        // The next request will pick up the new events
+        if (body.extensions?.to_device && c.get('deviceId')) {
+          const result = await getToDeviceMessages(db, userId, c.get('deviceId')!, body.extensions.to_device.since,
+            body.extensions.to_device.limit || 100);
+          response.extensions.to_device = { events: result.events, next_batch: result.nextBatch };
+        }
+        if (body.extensions?.e2ee && response.extensions.e2ee) {
+          const latestKeys = await deviceKeyPosition(db);
+          const changed = await changedDeviceUsers(db, userId, parseSyncPosition(posToken).keys, latestKeys);
+          response.extensions.e2ee.device_lists = {changed, left:[]};
+          response.pos = `${currentStreamPos}_dk${latestKeys}`;
+        }
       } else {
         console.log('[sliding-sync] Wait timed out, no new events');
       }

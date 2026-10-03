@@ -3,20 +3,24 @@
 import { Hono } from 'hono';
 import type { AppEnv, PDU } from '../types';
 import { Errors } from '../utils/errors';
-import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
+import { generateSigningKeyPair, signJson, sha256, verifySignature } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
   getRemoteKeysWithNotarySignature,
-  verifyRemoteSignature,
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoomState } from '../services/database';
-import { resolveState } from '../services/state-resolution';
-
-// Supported room versions (v1-v12 per Matrix Spec v1.17)
-const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+import { eventVerifier, isObject } from '../services/federation-events';
+import { parseUserId } from '../utils/ids';
+import { getRoom, getEvent, getEventsByIds, storeEvent, updateMembership, notifyUsersOfEvent } from '../services/database';
+import { validateJoinGraph } from '../services/remote-rooms';
+import { storeDeviceMessage, wakeDeviceSync } from '../services/device-messages';
+import { federationGet } from '../services/federation-keys';
+import { readFederationJson } from '../services/federation-http';
+import { federationMediaResponse } from '../services/federation-media';
+import { receiveRemoteInvite } from '../services/remote-invites';
 
 const app = new Hono<AppEnv>();
 
@@ -35,6 +39,25 @@ app.get('/_matrix/federation/v1/version', async (c) => {
 // Key endpoints (/_matrix/key/*) remain unauthenticated as they are used to establish trust
 // Version endpoint is also unauthenticated as it's used for initial contact
 app.use('/_matrix/federation/v1/*', requireFederationAuth());
+app.use('/_matrix/federation/v2/*', requireFederationAuth());
+
+// Signed requests still need room authorization before reading private room data.
+app.use('/_matrix/federation/v1/*', async (c, next) => {
+  const match = c.req.path.match(/\/(state|state_ids|event_auth|backfill|get_missing_events)\/([^/]+)/);
+  let roomId = match ? decodeURIComponent(match[2]) : undefined;
+  const eventMatch = c.req.path.match(/\/event\/([^/]+)$/);
+  if (eventMatch) roomId = (await getEvent(c.env.DB, decodeURIComponent(eventMatch[1])))?.room_id;
+  if (roomId) {
+    const origin = c.get('federationOrigin' as any) as string;
+    const members = await c.env.DB.prepare("SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'")
+      .bind(roomId).all<{ user_id: string }>();
+    if (!members.results.some(m => parseUserId(m.user_id)?.serverName === origin)) {
+      return Errors.forbidden('Origin server is not joined to the room').toResponse();
+    }
+  }
+  return next();
+});
+
 
 // GET /_matrix/key/v2/server - Get server signing keys
 app.get('/_matrix/key/v2/server', async (c) => {
@@ -503,215 +526,52 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   const { pdus, edus } = body;
   const pduResults: Record<string, any> = {};
 
-  // Process incoming PDUs (Persistent Data Units - events)
-  for (const pdu of pdus || []) {
+  const verifyEvent = eventVerifier(c.env);
+  if (!Array.isArray(pdus ?? []) || (pdus?.length ?? 0) > 50 || !Array.isArray(edus ?? []) || (edus?.length ?? 0) > 100) {
+    return Errors.invalidParam('transaction', 'Invalid federation transaction size').toResponse();
+  }
+  for (const raw of pdus || []) {
+    let eventId = 'unknown';
     try {
-      const eventId = pdu.event_id;
-      const roomId = pdu.room_id;
-
-      // Check if we've already processed this PDU
-      const existingPdu = await c.env.DB.prepare(
-        `SELECT accepted, rejection_reason FROM processed_pdus WHERE event_id = ?`
-      ).bind(eventId).first<{ accepted: number; rejection_reason: string | null }>();
-
-      if (existingPdu) {
-        // Already processed
-        if (existingPdu.accepted) {
-          pduResults[eventId] = {};
-        } else {
-          pduResults[eventId] = {
-            error: existingPdu.rejection_reason || 'Previously rejected',
-          };
-        }
-        continue;
+      if (!isObject(raw) || typeof raw.room_id !== 'string') throw new Error('Missing room ID');
+      const room = await getRoom(c.env.DB, raw.room_id);
+      if (!room) throw new Error('Room not joined');
+      const pdu = await verifyEvent(raw, room.room_version, room.room_id);
+      eventId = pdu.event_id;
+      if (await getEvent(c.env.DB, eventId)) { pduResults[eventId] = {}; continue; }
+      const state = await getRoomState(c.env.DB, room.room_id);
+      if (!state.some(e => e.type === 'm.room.member' && e.content.membership === 'join' &&
+          parseUserId(e.state_key!)?.serverName === origin)) throw new Error('Origin server is not in this room');
+      const auth = await getEventsByIds(c.env.DB, pdu.auth_events);
+      if (auth.length !== pdu.auth_events.length) {
+        const response = await federationGet(origin,
+          `/_matrix/federation/v1/event_auth/${encodeURIComponent(room.room_id)}/${encodeURIComponent(eventId)}`,
+          c.env.SERVER_NAME, c.env.DB, c.env.CACHE);
+        const body = await readFederationJson(response, 8 * 1024 * 1024);
+        if (!response.ok || !isObject(body) || !Array.isArray(body.auth_chain) || body.auth_chain.length > 5000) throw new Error('Missing event authorization chain');
+        for (const event of body.auth_chain) auth.push(await verifyEvent(event, room.room_version, room.room_id));
       }
-
-      // Validate basic PDU structure
-      if (!eventId || !roomId || !pdu.sender || !pdu.type || !pdu.content) {
-        pduResults[eventId || 'unknown'] = {
-          error: 'Invalid PDU structure',
-        };
-        continue;
+      // Include known ancestors, without letting historic auth events overwrite current state.
+      const known = new Map([...state, ...auth].map(e => [e.event_id, e]));
+      let frontier = [...known.values()].flatMap(e => e.auth_events).filter(id => !known.has(id));
+      for (let i = 0; frontier.length && i < 100; i++) {
+        const batch = await getEventsByIds(c.env.DB, [...new Set(frontier)].slice(0, 80));
+        if (!batch.length) break;
+        batch.forEach(e => known.set(e.event_id, e));
+        frontier = [...known.values()].flatMap(e => e.auth_events).filter(id => !known.has(id));
       }
-
-      // Get the origin server from the sender
-      const pduOrigin = (pdu.sender as string).split(':')[1];
-      if (!pduOrigin) {
-        pduResults[eventId] = { error: 'Invalid sender format' };
-        continue;
+      validateJoinGraph([...known.values()], state, pdu, room.room_version);
+      await storeEvent(c.env.DB, pdu);
+      if (pdu.type === 'm.room.member' && pdu.state_key !== undefined) {
+        await updateMembership(c.env.DB, room.room_id, pdu.state_key,
+          pdu.content.membership as import('../types').Membership, eventId,
+          typeof pdu.content.displayname === 'string' ? pdu.content.displayname : undefined,
+          typeof pdu.content.avatar_url === 'string' ? pdu.content.avatar_url : undefined);
       }
-
-      // Verify PDU signatures
-      if (pdu.signatures) {
-        let signatureValid = false;
-        const signatories = Object.keys(pdu.signatures);
-
-        for (const signatory of signatories) {
-          const keyIds = Object.keys(pdu.signatures[signatory]);
-          for (const keyId of keyIds) {
-            try {
-              const isValid = await verifyRemoteSignature(
-                pdu,
-                signatory,
-                keyId,
-                c.env.DB,
-                c.env.CACHE
-              );
-              if (isValid) {
-                signatureValid = true;
-                break;
-              }
-            } catch (e) {
-              console.warn(`Signature verification failed for ${signatory}:${keyId}:`, e);
-            }
-          }
-          if (signatureValid) break;
-        }
-
-        if (!signatureValid && pduOrigin !== origin) {
-          // PDU from third party without valid signature
-          pduResults[eventId] = { error: 'Invalid signature' };
-          await c.env.DB.prepare(
-            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-             VALUES (?, ?, ?, ?, 0, ?)`
-          ).bind(eventId, pduOrigin, roomId, Date.now(), 'Invalid signature').run();
-          continue;
-        }
-      }
-
-      // Verify content hash if present
-      if (pdu.hashes?.sha256) {
-        try {
-          const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
-          if (!hashValid) {
-            pduResults[eventId] = { error: 'Content hash mismatch' };
-            await c.env.DB.prepare(
-              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-               VALUES (?, ?, ?, ?, 0, ?)`
-            ).bind(eventId, pduOrigin, roomId, Date.now(), 'Content hash mismatch').run();
-            continue;
-          }
-        } catch (hashErr) {
-          console.warn(`[federation] Content hash check failed for ${eventId}:`, hashErr);
-        }
-      }
-
-      // Check if the room exists locally
-      const room = await c.env.DB.prepare(
-        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-      // Run event authorization check if we have room state
-      if (room) {
-        try {
-          const roomState = await getRoomState(c.env.DB, roomId);
-          const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
-          if (!authResult.allowed) {
-            pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
-            await c.env.DB.prepare(
-              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-               VALUES (?, ?, ?, ?, 0, ?)`
-            ).bind(eventId, pduOrigin, roomId, Date.now(), authResult.error || 'Auth failed').run();
-            continue;
-          }
-        } catch (authErr) {
-          console.warn(`[federation] Auth check failed for ${eventId}, accepting anyway:`, authErr);
-        }
-      }
-
-      // Accept the PDU
+      await notifyUsersOfEvent(c.env, room.room_id, eventId, pdu.type);
       pduResults[eventId] = {};
-
-      // Record that we processed this PDU
-      await c.env.DB.prepare(
-        `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-         VALUES (?, ?, ?, ?, 1, NULL)`
-      ).bind(eventId, pduOrigin, roomId, Date.now()).run();
-
-      // If room exists, store the event
-      if (room) {
-        try {
-          await c.env.DB.prepare(
-            `INSERT OR IGNORE INTO events
-             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            eventId,
-            roomId,
-            pdu.sender,
-            pdu.type,
-            pdu.state_key ?? null,
-            JSON.stringify(pdu.content),
-            pdu.origin_server_ts,
-            pdu.depth || 0,
-            JSON.stringify(pdu.auth_events || []),
-            JSON.stringify(pdu.prev_events || []),
-            pdu.hashes ? JSON.stringify(pdu.hashes) : null,
-            pdu.signatures ? JSON.stringify(pdu.signatures) : null
-          ).run();
-
-          // Update room state
-          if (pdu.state_key !== undefined) {
-            // If the PDU has multiple prev_events, we may need state resolution
-            const prevEvents = pdu.prev_events || [];
-            if (prevEvents.length > 1 && room) {
-              try {
-                // Fetch current room state and resolve with new event
-                const currentState = await getRoomState(c.env.DB, roomId);
-                const newEvent: PDU = {
-                  event_id: eventId,
-                  room_id: roomId,
-                  sender: pdu.sender,
-                  type: pdu.type,
-                  state_key: pdu.state_key,
-                  content: pdu.content,
-                  origin_server_ts: pdu.origin_server_ts,
-                  depth: pdu.depth || 0,
-                  auth_events: pdu.auth_events || [],
-                  prev_events: prevEvents,
-                };
-                const resolved = resolveState(room.room_version, [currentState, [newEvent]]);
-                // Apply resolved state
-                for (const stateEvent of resolved) {
-                  if (stateEvent.state_key !== undefined) {
-                    await c.env.DB.prepare(
-                      `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                       VALUES (?, ?, ?, ?)`
-                    ).bind(roomId, stateEvent.type, stateEvent.state_key, stateEvent.event_id).run();
-                  }
-                }
-              } catch (resolveErr) {
-                console.warn(`[federation] State resolution failed for ${eventId}, falling back:`, resolveErr);
-                await c.env.DB.prepare(
-                  `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                   VALUES (?, ?, ?, ?)`
-                ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
-              }
-            } else {
-              await c.env.DB.prepare(
-                `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                 VALUES (?, ?, ?, ?)`
-              ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
-            }
-          }
-        } catch (e) {
-          console.error(`Failed to store event ${eventId}:`, e);
-        }
-      }
-    } catch (e: any) {
-      const eventId = pdu?.event_id || 'unknown';
-      pduResults[eventId] = {
-        error: e.message || 'Unknown error',
-      };
-
-      // Record rejection
-      if (pdu?.event_id && pdu?.room_id) {
-        const pduOrigin = (pdu.sender as string)?.split(':')[1] || origin;
-        await c.env.DB.prepare(
-          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-           VALUES (?, ?, ?, ?, 0, ?)`
-        ).bind(pdu.event_id, pduOrigin, pdu.room_id, Date.now(), e.message || 'Unknown error').run();
-      }
+    } catch (error) {
+      pduResults[eventId] = { error: error instanceof Error ? error.message : 'Invalid federation event' };
     }
   }
 
@@ -821,9 +681,23 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           // Handle read receipts
           break;
 
-        case 'm.direct_to_device':
-          // Handle to-device messages
+        case 'm.direct_to_device': {
+          if (!isObject(content) || typeof content.sender !== 'string' || parseUserId(content.sender)?.serverName !== origin ||
+              typeof content.type !== 'string' || typeof content.message_id !== 'string' || !isObject(content.messages)) break;
+          for (const [user, devices] of Object.entries(content.messages)) {
+            if (parseUserId(user)?.serverName !== c.env.SERVER_NAME || !isObject(devices)) continue;
+            for (const [deviceId, payload] of Object.entries(devices)) {
+              const recipients = await c.env.DB.prepare(`SELECT device_id FROM devices WHERE user_id=? AND (?='*' OR device_id=?)`)
+                .bind(user, deviceId, deviceId).all<{device_id:string}>();
+              for (const recipient of recipients.results) {
+                await storeDeviceMessage(c.env.DB, {userId:user,deviceId:recipient.device_id,sender:content.sender,
+                  type:content.type,content:payload,id:`${origin}:${content.message_id}`});
+              }
+            }
+            await wakeDeviceSync(c.env, user);
+          }
           break;
+        }
 
         case 'm.signing_key_update':
           // Handle cross-signing key updates
@@ -1357,6 +1231,26 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   });
 });
 
+for (const version of ['v1', 'v2']) app.use(`/_matrix/federation/${version}/send_join/:roomId/:eventId`, async (c, next) => {
+  const roomId = c.req.param('roomId')!;
+  const room = await getRoom(c.env.DB, roomId);
+  if (!room) return Errors.notFound('Room not found').toResponse();
+  try {
+    const body = await c.req.json();
+    const event = await eventVerifier(c.env)(body, room.room_version, roomId);
+    if (event.event_id !== c.req.param('eventId') || event.type !== 'm.room.member' ||
+        event.content.membership !== 'join' || event.sender !== event.state_key ||
+        parseUserId(event.sender)?.serverName !== c.get('federationOrigin' as any)) {
+      return Errors.forbidden('Invalid join event').toResponse();
+    }
+    const auth = checkEventAuth(event, await getRoomState(c.env.DB, roomId), room.room_version);
+    if (!auth.allowed) return Errors.forbidden(auth.error).toResponse();
+    if (!await getEvent(c.env.DB, event.event_id)) await storeEvent(c.env.DB, event);
+    await updateMembership(c.env.DB, roomId, event.sender, 'join', event.event_id);
+    return next();
+  } catch { return Errors.forbidden('Invalid or unsigned join event').toResponse(); }
+});
+
 // PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join
 app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   const roomId = c.req.param('roomId');
@@ -1798,108 +1692,11 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
 
 // PUT /_matrix/federation/v2/invite/:roomId/:eventId - Receive invite (v2)
 app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
-  // roomId is available from route params but we validate from the event body
-  void c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: {
-    room_version: string;
-    event: any;
-    invite_room_state?: any[];
-  };
-
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  const roomVersion = body.room_version;
-  const inviteEvent = body.event;
-
-  if (!roomVersion) {
-    return Errors.missingParam('room_version').toResponse();
-  }
-
-  if (!inviteEvent) {
-    return Errors.missingParam('event').toResponse();
-  }
-
-  // Check room version is supported
-  if (!SUPPORTED_ROOM_VERSIONS.includes(roomVersion)) {
-    return c.json(
-      { errcode: 'M_INCOMPATIBLE_ROOM_VERSION', error: `Unsupported room version: ${roomVersion}` },
-      400
-    );
-  }
-
-  // Validate the event is an invite
-  if (inviteEvent.type !== 'm.room.member' || inviteEvent.content?.membership !== 'invite') {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event is not an invite event' },
-      400
-    );
-  }
-
-  // Validate event ID matches
-  if (inviteEvent.event_id && inviteEvent.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Validate the invite is for a local user
-  const stateKey = inviteEvent.state_key;
-  if (!stateKey || !stateKey.includes(':')) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Invalid state_key for invite' },
-      400
-    );
-  }
-
-  const invitedServer = stateKey.split(':')[1];
-  if (invitedServer !== c.env.SERVER_NAME) {
-    return c.json(
-      { errcode: 'M_FORBIDDEN', error: 'User is not local to this server' },
-      403
-    );
-  }
-
-  // Check if user exists locally
-  const localUser = await c.env.DB.prepare(
-    `SELECT user_id FROM users WHERE user_id = ?`
-  ).bind(stateKey).first<{ user_id: string }>();
-
-  if (!localUser) {
-    return c.json(
-      { errcode: 'M_NOT_FOUND', error: 'User not found' },
-      404
-    );
-  }
-
-  // Sign the invite event and return it
-  const key = await c.env.DB.prepare(
-    `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 2`
-  ).first<{ key_id: string; private_key_jwk: string | null }>();
-
-  if (!key || !key.private_key_jwk) {
-    return c.json(
-      { errcode: 'M_UNKNOWN', error: 'Server signing key not configured' },
-      500
-    );
-  }
-
-  // Sign the event
-  const signedEvent = await signJson(
-    inviteEvent,
-    c.env.SERVER_NAME,
-    key.key_id,
-    JSON.parse(key.private_key_jwk)
-  );
-
-  // v2 returns { event: signedEvent }
-  return c.json({ event: signedEvent });
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return Errors.badJson().toResponse(); }
+  const event = await receiveRemoteInvite(c.env, c.get('federationOrigin' as any) as string,
+    c.req.param('roomId'), c.req.param('eventId'), body);
+  return c.json({ event });
 });
 
 // GET /_matrix/federation/v1/query/directory - Resolve room alias
@@ -2649,14 +2446,7 @@ app.get('/_matrix/federation/v1/media/download/:mediaId', async (c) => {
     `SELECT content_type, filename FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
-  }
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-
-  return new Response(object.body, { headers });
+  return federationMediaResponse(object.body, metadata?.content_type || 'application/octet-stream', metadata?.filename);
 });
 
 // GET /_matrix/federation/v1/media/thumbnail/:mediaId - Get thumbnail via federation
@@ -2675,17 +2465,13 @@ app.get('/_matrix/federation/v1/media/thumbnail/:mediaId', async (c) => {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  const isImage = metadata.content_type.startsWith('image/');
 
   // Check for pre-generated thumbnail
   const thumbnailKey = `thumb_${mediaId}_${width}x${height}_${method}`;
   const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
   if (existingThumb) {
-    const headers = new Headers();
-    headers.set('Content-Type', 'image/jpeg');
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(existingThumb.body, { headers });
+    return federationMediaResponse(existingThumb.body, existingThumb.httpMetadata?.contentType || 'image/jpeg');
   }
 
   // Get original
@@ -2694,15 +2480,7 @@ app.get('/_matrix/federation/v1/media/thumbnail/:mediaId', async (c) => {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // If not an image, return original
-  const headers = new Headers();
-  headers.set('Content-Type', metadata.content_type);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  if (isImage) {
-    headers.set('X-Thumbnail-Generated', 'false');
-  }
-
-  return new Response(object.body, { headers });
+  return federationMediaResponse(object.body, metadata.content_type);
 });
 
 // ============================================

@@ -348,20 +348,20 @@ export async function getRoomEvents(
 
   if (direction === 'b') {
     // Backwards (newest first)
-    if (fromToken) {
+    if (fromToken !== undefined) {
       query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering < ? ORDER BY stream_ordering DESC LIMIT ?`;
       params.push(fromToken, limit);
     } else {
-      query = `SELECT * FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT ?`;
+      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering IS NOT NULL ORDER BY stream_ordering DESC LIMIT ?`;
       params.push(limit);
     }
   } else {
     // Forwards (oldest first)
-    if (fromToken) {
+    if (fromToken !== undefined) {
       query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > ? ORDER BY stream_ordering ASC LIMIT ?`;
       params.push(fromToken, limit);
     } else {
-      query = `SELECT * FROM events WHERE room_id = ? ORDER BY stream_ordering ASC LIMIT ?`;
+      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering IS NOT NULL ORDER BY stream_ordering ASC LIMIT ?`;
       params.push(limit);
     }
   }
@@ -600,16 +600,18 @@ export async function getEventsSince(
   db: D1Database,
   roomId: string,
   since: number,
-  limit: number = 100
+  limit: number = 100,
+  until: number = Number.MAX_SAFE_INTEGER,
+  newestFirst = false
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
      origin_server_ts, unsigned, depth, auth_events, prev_events
      FROM events
-     WHERE room_id = ? AND stream_ordering > ?
-     ORDER BY stream_ordering ASC
+     WHERE room_id = ? AND stream_ordering > ? AND stream_ordering <= ?
+     ORDER BY stream_ordering ${newestFirst ? 'DESC' : 'ASC'}
      LIMIT ?`
-  ).bind(roomId, since, limit).all<{
+  ).bind(roomId, since, until, limit).all<{
     event_id: string;
     room_id: string;
     sender: string;
@@ -761,11 +763,10 @@ export async function notifyUsersOfEvent(
       `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'`
     ).bind(roomId).all<{ user_id: string }>();
 
-    console.log('[database] Notifying', members.results.length, 'users of event', eventId,
-      'users:', members.results.map(m => m.user_id).join(', '));
+    const localMembers = members.results.filter(m => m.user_id.slice(m.user_id.indexOf(':') + 1) === env.SERVER_NAME);
 
     // Notify each user's SyncDurableObject in parallel
-    const notifications = members.results.map(async (member) => {
+    const notifications = localMembers.map(async (member) => {
       try {
         const syncDO = env.SYNC.get(env.SYNC.idFromName(member.user_id));
         await syncDO.fetch(new Request('http://internal/notify', {

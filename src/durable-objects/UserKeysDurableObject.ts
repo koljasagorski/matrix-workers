@@ -52,6 +52,18 @@ export class UserKeysDurableObject extends DurableObject<Env> {
         return this.putDeviceKeys(body.device_id, body.keys);
       }
 
+      if (path === '/device-keys/delete' && request.method === 'POST') {
+        const body = await request.json() as { device_id?: unknown };
+        if (typeof body?.device_id !== 'string' || !body.device_id) return new Response('Invalid device ID', {status:400});
+        const deviceId = body.device_id;
+        await this.ctx.storage.transaction(async storage => {
+          const ids = await storage.get<string[]>('device_ids') ?? [];
+          await storage.delete(`device_keys:${deviceId}`);
+          await storage.put('device_ids', ids.filter(id => id !== deviceId));
+        });
+        return Response.json({success:true});
+      }
+
       if (path === '/device-keys/list' && request.method === 'GET') {
         return this.listDeviceIds();
       }

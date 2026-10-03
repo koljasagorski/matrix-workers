@@ -2,6 +2,7 @@
 // Implements Matrix spec server discovery with SRV record support via Cloudflare DoH
 // Reference: https://spec.matrix.org/v1.12/server-server-api/#resolving-server-names
 
+import { assertFederationServer, assertFederationUrl, readFederationJson } from './federation-http';
 import { validateUrl } from '../utils/url-validator';
 
 export interface ServerDiscoveryResult {
@@ -37,18 +38,24 @@ const DISCOVERY_CACHE_TTL = 3600; // 1 hour
  */
 export async function discoverServer(
   serverName: string,
-  cache?: KVNamespace
+  cache?: KVNamespace,
+  signal?: AbortSignal
 ): Promise<ServerDiscoveryResult> {
+  signal?.throwIfAborted();
+  assertFederationServer(serverName);
   // Check cache first if available
   if (cache) {
     const cached = await cache.get(`${DISCOVERY_CACHE_PREFIX}${serverName}`);
     if (cached) {
-      return JSON.parse(cached);
+      const value = JSON.parse(cached) as ServerDiscoveryResult;
+      assertFederationUrl(buildServerUrl(value));
+      return value;
     }
   }
 
-  const result = await performDiscovery(serverName);
+  const result = await performDiscovery(serverName, signal);
 
+  assertFederationUrl(buildServerUrl(result));
   // Cache the result if cache is available
   if (cache) {
     await cache.put(`${DISCOVERY_CACHE_PREFIX}${serverName}`, JSON.stringify(result), {
@@ -62,7 +69,7 @@ export async function discoverServer(
 /**
  * Perform the actual server discovery without caching
  */
-async function performDiscovery(serverName: string): Promise<ServerDiscoveryResult> {
+async function performDiscovery(serverName: string, signal?: AbortSignal): Promise<ServerDiscoveryResult> {
   // Step 1: Check if server name is an IP literal
   if (isIPLiteral(serverName)) {
     // IP literals use port 8448 by default
@@ -85,13 +92,13 @@ async function performDiscovery(serverName: string): Promise<ServerDiscoveryResu
   }
 
   // Step 3: Try .well-known/matrix/server delegation
-  const wellKnownResult = await tryWellKnown(serverName);
+  const wellKnownResult = await tryWellKnown(serverName, signal);
   if (wellKnownResult) {
     return wellKnownResult;
   }
 
   // Step 4: Try SRV record lookup (_matrix-fed._tcp, then _matrix._tcp)
-  const srvResult = await trySRVRecords(serverName);
+  const srvResult = await trySRVRecords(serverName, signal);
   if (srvResult) {
     return srvResult;
   }
@@ -124,7 +131,7 @@ function isIPLiteral(hostname: string): boolean {
 /**
  * Try to fetch .well-known/matrix/server for delegation
  */
-async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult | null> {
+async function tryWellKnown(serverName: string, signal?: AbortSignal): Promise<ServerDiscoveryResult | null> {
   const wellKnownUrl = `https://${serverName}/.well-known/matrix/server`;
 
   // Validate URL to prevent SSRF
@@ -137,20 +144,24 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
   try {
     const response = await fetch(wellKnownUrl, {
       headers: { Accept: 'application/json' },
+      redirect: 'manual',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
       cf: { cacheTtl: 3600, cacheEverything: true },
     });
 
     if (!response.ok) {
+      await response.body?.cancel();
       return null;
     }
 
-    const wellKnown = (await response.json()) as { 'm.server'?: string };
+    const wellKnown = (await readFederationJson(response, 65536)) as { 'm.server'?: string };
     const delegatedServer = wellKnown['m.server'];
 
     if (!delegatedServer || typeof delegatedServer !== 'string') {
       return null;
     }
 
+    assertFederationServer(delegatedServer);
     // Validate the delegated server isn't malicious
     const delegatedUrl = `https://${delegatedServer}/`;
     const delegatedValidation = validateUrl(delegatedUrl);
@@ -172,7 +183,7 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
 
     // No port specified, continue discovery on the delegated name
     // Check SRV records for the delegated server
-    const srvResult = await trySRVRecords(delegatedServer);
+    const srvResult = await trySRVRecords(delegatedServer, signal);
     if (srvResult) {
       return srvResult;
     }
@@ -184,6 +195,7 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
       tlsHostname: delegatedServer,
     };
   } catch (error) {
+    signal?.throwIfAborted();
     // Well-known not available or invalid
     console.debug(`Well-known lookup failed for ${serverName}:`, error);
     return null;
@@ -194,9 +206,9 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
  * Try SRV record lookups via Cloudflare DNS-over-HTTPS
  * First tries _matrix-fed._tcp (Matrix 1.8+), then _matrix._tcp (legacy)
  */
-async function trySRVRecords(serverName: string): Promise<ServerDiscoveryResult | null> {
+async function trySRVRecords(serverName: string, signal?: AbortSignal): Promise<ServerDiscoveryResult | null> {
   // Try the new _matrix-fed._tcp record first (Matrix 1.8+)
-  const fedSrvRecords = await lookupSRVRecords(serverName, '_matrix-fed._tcp');
+  const fedSrvRecords = await lookupSRVRecords(serverName, '_matrix-fed._tcp', signal);
   if (fedSrvRecords.length > 0) {
     const selected = selectSRVRecord(fedSrvRecords);
     return {
@@ -207,7 +219,7 @@ async function trySRVRecords(serverName: string): Promise<ServerDiscoveryResult 
   }
 
   // Fall back to legacy _matrix._tcp record
-  const legacySrvRecords = await lookupSRVRecords(serverName, '_matrix._tcp');
+  const legacySrvRecords = await lookupSRVRecords(serverName, '_matrix._tcp', signal);
   if (legacySrvRecords.length > 0) {
     const selected = selectSRVRecord(legacySrvRecords);
     return {
@@ -223,7 +235,7 @@ async function trySRVRecords(serverName: string): Promise<ServerDiscoveryResult 
 /**
  * Look up SRV records via Cloudflare DNS-over-HTTPS
  */
-async function lookupSRVRecords(serverName: string, recordName: string): Promise<SRVRecord[]> {
+async function lookupSRVRecords(serverName: string, recordName: string, signal?: AbortSignal): Promise<SRVRecord[]> {
   const queryName = `${recordName}.${serverName}`;
 
   try {
@@ -234,11 +246,13 @@ async function lookupSRVRecords(serverName: string, recordName: string): Promise
         headers: {
           Accept: 'application/dns-json',
         },
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
         cf: { cacheTtl: 300, cacheEverything: true },
       }
     );
 
     if (!response.ok) {
+      await response.body?.cancel();
       return [];
     }
 
@@ -284,6 +298,7 @@ async function lookupSRVRecords(serverName: string, recordName: string): Promise
 
     return srvRecords;
   } catch (error) {
+    signal?.throwIfAborted();
     console.debug(`SRV lookup failed for ${queryName}:`, error);
     return [];
   }

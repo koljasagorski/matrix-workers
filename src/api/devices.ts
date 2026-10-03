@@ -7,7 +7,9 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { verifyPassword } from '../utils/crypto';
+import { requirePasswordConfirmation } from '../services/password-auth';
+import { removeDevices } from '../services/device-removal';
+import { isObject } from '../services/federation-events';
 
 const app = new Hono<AppEnv>();
 
@@ -128,44 +130,9 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     // No auth provided
   }
 
-  // If no auth provided, return UIA response
-  if (!auth) {
-    const sessionId = crypto.randomUUID();
-    return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
-    }, 401);
-  }
-
-  // Verify password if auth provided
-  if (auth.type === 'm.login.password') {
-    const user = await db.prepare(`
-      SELECT password_hash FROM users WHERE user_id = ?
-    `).bind(userId).first<{ password_hash: string }>();
-
-    if (!user || !auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-
-    const valid = await verifyPassword(auth.password, user.password_hash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-  }
-
-  // Delete the device and its access tokens
-  await db.prepare(`
-    DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
-
-  await db.prepare(`
-    DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
-
-  await db.prepare(`
-    DELETE FROM devices WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
+  const denied = await requirePasswordConfirmation(db, userId, auth);
+  if (denied) return denied;
+  await removeDevices(c.env, userId, [deviceId]);
 
   return c.json({});
 });
@@ -182,50 +149,12 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  if (!body.devices || !Array.isArray(body.devices)) {
-    return Errors.missingParam('devices').toResponse();
+  if (!isObject(body) || !Array.isArray(body.devices) || body.devices.some(id => typeof id !== 'string' || !id.length) || body.devices.length > 100) {
+    return Errors.invalidParam('devices').toResponse();
   }
-
-  // If no auth provided, return UIA response
-  if (!body.auth) {
-    const sessionId = crypto.randomUUID();
-    return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
-    }, 401);
-  }
-
-  // Verify password if auth provided
-  if (body.auth.type === 'm.login.password') {
-    const user = await db.prepare(`
-      SELECT password_hash FROM users WHERE user_id = ?
-    `).bind(userId).first<{ password_hash: string }>();
-
-    if (!user || !body.auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-
-    const valid = await verifyPassword(body.auth.password, user.password_hash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-  }
-
-  // Delete each device
-  for (const deviceId of body.devices) {
-    await db.prepare(`
-      DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
-
-    await db.prepare(`
-      DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
-
-    await db.prepare(`
-      DELETE FROM devices WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
-  }
+  const denied = await requirePasswordConfirmation(db, userId, body.auth);
+  if (denied) return denied;
+  await removeDevices(c.env, userId, body.devices);
 
   return c.json({});
 });

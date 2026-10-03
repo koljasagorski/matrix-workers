@@ -1,6 +1,7 @@
 // Event Authorization Rules per Matrix Spec §11.3
 // Implements all 10 authorization rules for validating events
 
+import { parseUserId } from '../utils/ids';
 import type { PDU, RoomPowerLevelsContent, RoomJoinRulesContent, RoomMemberContent } from '../types';
 import { getRoomVersion, type RoomVersionBehavior } from './room-versions';
 
@@ -35,22 +36,15 @@ function getState(state: RoomStateMap, type: string, key: string = ''): PDU | un
 
 /** Get power levels from state, with defaults per spec */
 function getPowerLevels(state: RoomStateMap): RoomPowerLevelsContent {
-  const plEvent = getState(state, 'm.room.power_levels');
-  if (plEvent) {
-    return plEvent.content as RoomPowerLevelsContent;
-  }
-  // Default power levels when no power_levels event exists
-  return {
-    users: {},
-    users_default: 0,
-    events: {},
-    events_default: 0,
-    state_default: 50,
-    ban: 50,
-    kick: 50,
-    redact: 50,
-    invite: 0,
-  };
+  const pl = getState(state, 'm.room.power_levels');
+  const create = getState(state, 'm.room.create');
+  const levels: RoomPowerLevelsContent = pl ? { ...pl.content } : { users: {} };
+  levels.users = { ...levels.users };
+  if (create?.content.room_version === '12') {
+    const extra = Array.isArray(create.content.additional_creators) ? create.content.additional_creators : [];
+    for (const id of [create.sender, ...extra]) if (typeof id === 'string') levels.users[id] = Infinity;
+  } else if (!pl && create) levels.users[create.sender] = 100;
+  return levels;
 }
 
 /** Get user's power level from power levels content */
@@ -96,6 +90,9 @@ export function checkEventAuth(
     return { allowed: false, error: 'No m.room.create event in room state' };
   }
 
+  if (createEvent.content['m.federate'] === false && event.sender.slice(event.sender.indexOf(':') + 1) !==
+      createEvent.sender.slice(createEvent.sender.indexOf(':') + 1)) return { allowed: false, error: 'Room does not federate' };
+
   // Rule 3: If type is m.room.member
   if (event.type === 'm.room.member') {
     return checkMemberEvent(event, state, versionBehavior);
@@ -112,6 +109,8 @@ export function checkEventAuth(
   if (event.type === 'm.room.third_party_invite') {
     return checkThirdPartyInvite(event, state);
   }
+
+  if (event.state_key?.startsWith('@') && event.state_key !== event.sender) return { allowed: false, error: 'Invalid state key owner' };
 
   // Rule 6: Check power levels for state events
   if (event.state_key !== undefined) {
@@ -153,7 +152,7 @@ function checkMemberEvent(
   const targetUserId = event.state_key!;
   const membership = content.membership;
 
-  if (!membership) {
+  if (!membership || !parseUserId(targetUserId ?? '')) {
     return { allowed: false, error: 'Missing membership in content' };
   }
 
@@ -173,6 +172,10 @@ function checkMemberEvent(
 
   switch (membership) {
     case 'join': {
+      if (senderMembership === 'ban') return { allowed: false, error: 'Banned users cannot join' };
+      const create = getState(state, 'm.room.create');
+      if (event.sender === targetUserId && targetUserId === create?.sender &&
+          event.prev_events.length === 1 && event.prev_events[0] === create.event_id) return { allowed: true };
       // If sender != state_key, reject
       if (event.sender !== targetUserId) {
         return { allowed: false, error: 'Cannot join on behalf of another user' };
@@ -215,6 +218,7 @@ function checkMemberEvent(
     }
 
     case 'invite': {
+      if (content.third_party_invite) return { allowed: false, error: 'Third-party invite authorization is not supported' };
       // Sender must be joined
       if (senderMembership !== 'join') {
         return { allowed: false, error: 'Sender must be joined to invite' };
@@ -262,7 +266,6 @@ function checkMemberEvent(
         if (senderPower < (powerLevels.ban ?? 50)) {
           return { allowed: false, error: 'Insufficient power level to unban' };
         }
-        return { allowed: true };
       }
 
       // Sender needs kick power and higher power than target
@@ -316,8 +319,8 @@ function checkMemberEvent(
       }
 
       // Must not already be joined
-      if (senderMembership === 'join') {
-        return { allowed: false, error: 'Already joined' };
+      if (senderMembership === 'join' || senderMembership === 'invite') {
+        return { allowed: false, error: 'Already joined or invited' };
       }
 
       return { allowed: true };
@@ -380,72 +383,49 @@ function checkPowerLevelChange(
   versionBehavior: RoomVersionBehavior
 ): AuthResult {
   const newPl = event.content as RoomPowerLevelsContent;
+  const create = getState(state, 'm.room.create');
+  if (versionBehavior.version === '12' && create) {
+    const creators = [create.sender, ...(Array.isArray(create.content.additional_creators) ? create.content.additional_creators : [])];
+    if (creators.some(id => typeof id === 'string' && Object.hasOwn(newPl.users ?? {}, id))) {
+      return { allowed: false, error: 'Room creators must not be listed in power levels' };
+    }
+  }
   const currentPlEvent = getState(state, 'm.room.power_levels');
   const currentPl = (currentPlEvent?.content ?? {}) as RoomPowerLevelsContent;
 
-  // Validate integer power levels for v10+
+  const scalars = ['ban','events_default','invite','kick','redact','state_default','users_default'] as const;
+  const objects = ['events','users','notifications'] as const;
   if (versionBehavior.integerPowerLevels) {
-    const allValues = [
-      newPl.ban, newPl.events_default, newPl.invite, newPl.kick,
-      newPl.redact, newPl.state_default, newPl.users_default,
-      ...(newPl.events ? Object.values(newPl.events) : []),
-      ...(newPl.users ? Object.values(newPl.users) : []),
-      newPl.notifications?.room,
-    ].filter((v): v is number => v !== undefined);
-
-    for (const val of allValues) {
-      if (!Number.isInteger(val)) {
-        return { allowed: false, error: 'Power levels must be integers in this room version' };
+    for (const field of scalars) if (newPl[field] !== undefined && !Number.isSafeInteger(newPl[field])) {
+      return { allowed: false, error: 'Power levels must be integers' };
+    }
+    for (const field of objects) {
+      const values = newPl[field];
+      if (values !== undefined && (!values || typeof values !== 'object' || Array.isArray(values) ||
+          Object.values(values).some(value => !Number.isSafeInteger(value)))) {
+        return { allowed: false, error: 'Invalid power level map' };
+      }
+    }
+    if (Object.keys(newPl.users ?? {}).some(id => !parseUserId(id))) return { allowed: false, error: 'Invalid power level user' };
+  }
+  if (!currentPlEvent) return { allowed: true };
+  for (const field of scalars) {
+    if (newPl[field] !== currentPl[field] && ((newPl[field] ?? 0) > senderPower || (currentPl[field] ?? 0) > senderPower)) {
+      return { allowed: false, error: 'Cannot change a power level above own' };
+    }
+  }
+  for (const field of objects) {
+    const before: Record<string, number> = currentPl[field] ?? {};
+    const after: Record<string, number> = newPl[field] ?? {};
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (before[key] === after[key]) continue;
+      if (after[key] !== undefined && after[key] > senderPower) return { allowed: false, error: 'Cannot grant power above own' };
+      if (before[key] !== undefined && (before[key] > senderPower ||
+          (field === 'users' && key !== event.sender && before[key] === senderPower))) {
+        return { allowed: false, error: 'Cannot alter equal or higher power' };
       }
     }
   }
-
-  // Check: sender cannot set power levels higher than their own
-  if (newPl.users) {
-    for (const [userId, level] of Object.entries(newPl.users)) {
-      if (level > senderPower) {
-        return { allowed: false, error: `Cannot set user ${userId} power level higher than own (${senderPower})` };
-      }
-      // Check if the sender is changing someone else's power level
-      const oldLevel = currentPl.users?.[userId] ?? currentPl.users_default ?? 0;
-      if (oldLevel !== level && userId !== event.sender) {
-        // To change another user's PL, sender must have higher PL than the old value
-        if (senderPower <= oldLevel) {
-          return { allowed: false, error: `Cannot change power of user with equal or higher power` };
-        }
-      }
-    }
-  }
-
-  // Check: sender cannot set event/state power levels higher than their own
-  const checkLevel = (val: number | undefined): AuthResult | null => {
-    if (val !== undefined && val > senderPower) {
-      return { allowed: false, error: `Cannot set power level higher than own (${senderPower})` };
-    }
-    return null;
-  };
-
-  const checks = [
-    checkLevel(newPl.ban),
-    checkLevel(newPl.events_default),
-    checkLevel(newPl.invite),
-    checkLevel(newPl.kick),
-    checkLevel(newPl.redact),
-    checkLevel(newPl.state_default),
-    checkLevel(newPl.users_default),
-  ];
-
-  for (const check of checks) {
-    if (check) return check;
-  }
-
-  if (newPl.events) {
-    for (const level of Object.values(newPl.events)) {
-      const result = checkLevel(level);
-      if (result) return result;
-    }
-  }
-
   return { allowed: true };
 }
 
@@ -460,20 +440,6 @@ function checkNonStateEventPower(event: PDU, state: RoomStateMap): AuthResult {
       allowed: false,
       error: `Insufficient power level for ${event.type} (have ${senderPower}, need ${requiredPower})`,
     };
-  }
-
-  // Special check for m.room.redaction
-  if (event.type === 'm.room.redaction') {
-    const redactPower = powerLevels.redact ?? 50;
-    if (senderPower < redactPower) {
-      // Check if sender is redacting their own event (always allowed)
-      // The actual check for own-event redaction requires looking up the target event,
-      // which is done by the caller
-      return {
-        allowed: false,
-        error: `Insufficient power level to redact (have ${senderPower}, need ${redactPower})`,
-      };
-    }
   }
 
   return { allowed: true };

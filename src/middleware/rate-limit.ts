@@ -21,6 +21,8 @@ const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
 };
 
 function getRateLimitType(path: string, method: string): string {
+  if (path.startsWith('/oauth/authorize') && method === 'POST') return 'login';
+  if (path === '/oauth/token' && method === 'POST') return 'login';
   if (path.includes('/login') && method === 'POST') return 'login';
   if (path.includes('/register') && method === 'POST') return 'register';
   if (path.includes('/sync')) return 'sync';

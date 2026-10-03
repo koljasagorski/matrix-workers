@@ -7,7 +7,8 @@
       "ES2022"
     ],
     "types": [
-      "./worker-configuration.d.ts"
+      "./worker-configuration.d.ts",
+      "node"
     ],
     "strict": true,
     "noEmit": true,

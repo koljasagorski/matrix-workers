@@ -8,10 +8,15 @@
 //
 // Messages are delivered via /sync and sliding sync extensions
 
+import { queueDeviceMessages } from '../services/federation-delivery';
+import { parseUserId } from '../utils/ids';
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { hashToken } from '../utils/crypto';
+import { isObject } from '../services/federation-events';
+import { storeDeviceMessage, wakeDeviceSync } from '../services/device-messages';
 
 const app = new Hono<AppEnv>();
 
@@ -28,30 +33,6 @@ interface ToDeviceRequest {
 // ============================================
 // Helper Functions
 // ============================================
-
-async function getNextStreamPosition(db: D1Database, streamName: string): Promise<number> {
-  // Atomic UPDATE with RETURNING - no race condition
-  const result = await db.prepare(`
-    UPDATE stream_positions
-    SET position = position + 1
-    WHERE stream_name = ?
-    RETURNING position
-  `).bind(streamName).first<{ position: number }>();
-
-  if (result) {
-    return result.position;
-  }
-
-  // Row doesn't exist - atomic upsert (edge case, should be created by migration)
-  const upsertResult = await db.prepare(`
-    INSERT INTO stream_positions (stream_name, position)
-    VALUES (?, 1)
-    ON CONFLICT (stream_name) DO UPDATE SET position = position + 1
-    RETURNING position
-  `).bind(streamName).first<{ position: number }>();
-
-  return upsertResult?.position ?? 1;
-}
 
 async function getUserDevices(db: D1Database, userId: string): Promise<string[]> {
   const devices = await db.prepare(`
@@ -71,11 +52,12 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   const eventType = c.req.param('eventType');
   const txnId = c.req.param('txnId');
   const db = c.env.DB;
+  const transactionKey = `to-device:${await hashToken(JSON.stringify([userId, c.get('deviceId'), eventType, txnId]))}`;
 
   // Check for duplicate transaction
   const existingTxn = await db.prepare(`
     SELECT response FROM transaction_ids WHERE user_id = ? AND txn_id = ?
-  `).bind(userId, txnId).first<{ response: string }>();
+  `).bind(userId, transactionKey).first<{ response: string }>();
 
   if (existingTxn) {
     // Return cached response for idempotency
@@ -89,12 +71,15 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
     return Errors.badJson().toResponse();
   }
 
-  if (!body.messages) {
+  if (!body || !isObject(body.messages)) {
     return Errors.missingParam('messages').toResponse();
   }
+  if (Object.entries(body.messages).some(([user, devices]) => !parseUserId(user) || !isObject(devices) ||
+      Object.values(devices).some(content => !isObject(content)))) return Errors.badJson().toResponse();
 
   // Process each recipient user
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
+    if (parseUserId(recipientUserId)?.serverName !== c.env.SERVER_NAME) continue;
     // Get list of device IDs to send to
     let targetDevices: string[];
 
@@ -103,39 +88,26 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
         // Send to all devices for this user
         targetDevices = await getUserDevices(db, recipientUserId);
       } else {
-        targetDevices = [deviceId];
+        targetDevices = (await getUserDevices(db, recipientUserId)).filter(id => id === deviceId);
       }
 
       // Create a message for each target device
       for (const targetDeviceId of targetDevices) {
-        const streamPosition = await getNextStreamPosition(db, 'to_device');
-        const messageId = `${userId}_${txnId}_${recipientUserId}_${targetDeviceId}_${Date.now()}`;
-
-        await db.prepare(`
-          INSERT INTO to_device_messages (
-            recipient_user_id, recipient_device_id, sender_user_id,
-            event_type, content, message_id, stream_position
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT (recipient_user_id, recipient_device_id, message_id) DO NOTHING
-        `).bind(
-          recipientUserId,
-          targetDeviceId,
-          userId,
-          eventType,
-          JSON.stringify(content),
-          messageId,
-          streamPosition
-        ).run();
+        await storeDeviceMessage(db, { userId:recipientUserId, deviceId:targetDeviceId, sender:userId,
+          type:eventType, content, id:transactionKey });
       }
     }
+    await wakeDeviceSync(c.env, recipientUserId);
   }
+
+  await queueDeviceMessages(c.env, userId, eventType, transactionKey, body.messages);
 
   // Store transaction for idempotency
   await db.prepare(`
     INSERT INTO transaction_ids (user_id, txn_id, response)
     VALUES (?, ?, '{}')
     ON CONFLICT (user_id, txn_id) DO NOTHING
-  `).bind(userId, txnId).run();
+  `).bind(userId, transactionKey).run();
 
   return c.json({});
 });
@@ -219,24 +191,9 @@ export async function getToDeviceMessages(
     content: JSON.parse(msg.content),
   }));
 
-  // Get the current max stream position for to-device messages
-  // This ensures we always return a valid next_batch, even on first sync
-  const currentPos = await db.prepare(`
-    SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM to_device_messages
-  `).first<{ max_pos: number }>();
-  const maxStreamPos = currentPos?.max_pos || 0;
-
-  // Return the appropriate next_batch:
-  // - If we returned messages: use the max position of those messages
-  // - Otherwise: use the current max stream position (client is caught up)
-  let nextBatch: string;
-  if (messages.results.length > 0) {
-    const maxReturnedPos = Math.max(...messages.results.map(m => m.stream_position));
-    nextBatch = String(maxReturnedPos);
-  } else {
-    // No messages to return - use current max position so client knows where we are
-    nextBatch = String(maxStreamPos);
-  }
+  // Never advance an empty read to a subsequently sampled global maximum: a
+  // message inserted between those reads would be acknowledged without delivery.
+  const nextBatch = String(messages.results.at(-1)?.stream_position ?? sincePos);
 
   return { events, nextBatch };
 }
