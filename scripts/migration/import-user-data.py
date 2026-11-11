@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline user/device/E2EE import into an EMPTY, STOPPED Synapse 1.162 database.
+"""Offline user/device/E2EE import into an EMPTY, STOPPED Synapse 1.165 database.
 
 No encrypted key material is interpreted or re-encrypted. The optional incomplete
 mode is exclusively for staging rehearsal; the final manifest must be complete.
@@ -15,7 +15,10 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).parent / "auth"))
+sys.path.insert(0, str(Path(__file__).parent))
 from migration_auth.common import native_token, TOKEN_HASH
+# One pin for both importers so they cannot drift apart.
+from rooms.plan import SCHEMA_VERSION, SYNAPSE_VERSION
 
 PRIORITIES = {"underride": 1, "sender": 2, "room": 3, "content": 4, "override": 5, "postcontent": 6}
 OWNED_TABLES = ["migration_legacy_passwords", "access_tokens", "refresh_tokens", "devices", "profiles",
@@ -278,8 +281,8 @@ def run(args):
     with psycopg.connect(os.environ[args.dsn_env]) as target:
         with target.cursor() as cursor:
             cursor.execute("SELECT version FROM schema_version")
-            if cursor.fetchone()[0] != 94:
-                raise ValueError("Expected initialized Synapse 1.162 schema94")
+            if cursor.fetchone()[0] != SCHEMA_VERSION:
+                raise ValueError(f"Expected initialized Synapse {SYNAPSE_VERSION} schema{SCHEMA_VERSION}")
             cursor.execute("CREATE TABLE IF NOT EXISTS migration_user_import (source_sha256 TEXT NOT NULL, completed BOOLEAN NOT NULL)")
             cursor.execute("SELECT count(*) FROM users")
             occupied = cursor.fetchone()[0]
@@ -308,7 +311,7 @@ def run(args):
     bridge.commit()
     bridge.close()
     os.chmod(bridge_path, 0o600)
-    manifest = {"synapse_version": "1.162.0", "source_sha256": digest, "complete": keys_complete and refresh_complete and filters_complete,
+    manifest = {"synapse_version": SYNAPSE_VERSION, "source_sha256": digest, "complete": keys_complete and refresh_complete and filters_complete,
         "overlay_sha256": {"user_keys": keys_sha256, "refresh_tokens": refresh_sha256, "client_filters": filters_sha256},
         "counts": {table: len(entries) for table, entries in plan.items()}, "opaque_backup_etags_rebased": sum(not str(row["etag"]).isdigit() for row in rows(source, "key_backup_versions")),
         "ciphertext_sha256": {table: hashlib.sha256(json_text(plan[table]).encode()).hexdigest() for table in ("e2e_device_keys_json", "e2e_cross_signing_keys", "e2e_room_keys")}}

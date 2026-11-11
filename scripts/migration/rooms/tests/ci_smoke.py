@@ -86,13 +86,13 @@ def main():
             # Also exercise actual transactional rollback/replay against the
             # initialized native schema, using a separate disposable database.
             schema = run("docker", "exec", pg, "pg_dump", "-U", "matrix", "-d", "synapse", "--schema-only", quiet=True).stdout
-            (data / "schema94.sql").write_text(schema)
+            (data / "schema95.sql").write_text(schema)
             base = ["docker", "run", "--rm", "--network", name, "-e", "PGHOST=" + pg,
                 "-e", "PGDATABASE=synapse", "-e", "POSTGRES_USER=matrix", "-e", "POSTGRES_PASSWORD=" + password,
                 "-v", str(repo / "scripts/migration") + ":/migration:ro", "-v", str(data) + ":/fixture",
                 "--entrypoint", "python", options.synapse_image]
             run(*base, "/migration/rooms/tests/staging_postgres.py", "--source", "/fixture/source.sqlite",
-                "--schema", "/fixture/schema94.sql", "--server-name", "example.org")
+                "--schema", "/fixture/schema95.sql", "--server-name", "example.org")
             run(*base, "/migration/import-rooms.py", "--source", "/fixture/source.sqlite", "--server-name", "example.org",
                 "--manifest", "/fixture/manifest.json", "--apply", "--synapse-stopped", quiet=True)
             run("docker", "start", native, quiet=True)
@@ -109,7 +109,7 @@ history=get('/rooms/'+room+'/messages?dir=b&limit=10')['chunk'];assert any(e['co
 r=urllib.request.Request('http://127.0.0.1:8008/_matrix/client/v3/rooms/'+room+'/state/m.room.topic',data=b'{"topic":"Disposable CI native auth check"}',method='PUT',headers={'Authorization':'Bearer disposable-native-fixture','Content-Type':'application/json'})
 assert json.load(urllib.request.urlopen(r,timeout=20))['event_id'].startswith('$')
 assert get('/rooms/'+room+'/state/m.room.topic')['topic']=='Disposable CI native auth check'
-print('Native schema94 startup, signed v12 state, classic sync, exact ciphertext history and future state authorization: OK')
+print('Native schema95 startup, signed v12 state, classic sync, exact ciphertext history and future state authorization: OK')
 '''
             run("docker", "exec", native, "python", "-c", check)
             spec = importlib.util.spec_from_file_location("deployment", repo / "deploy/vps/deploy-reviewed.py")

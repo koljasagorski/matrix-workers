@@ -1,5 +1,5 @@
-The room importer runs only in the pinned Synapse `v1.162.0` image against
-PostgreSQL schema94, with Synapse stopped and a freshly initialized room store.
+The room importer runs only in the pinned Synapse `v1.165.0` image against
+PostgreSQL schema95, with Synapse stopped and a freshly initialized room store.
 The user importer must commit first. Use environment variables for database
 credentials; never pass a password or access token as a command-line argument.
 
@@ -72,7 +72,7 @@ file and authoritative Durable Object exports alongside native backups.
 `rooms/tests/staging_postgres.py` exercises late-failure rollback, idempotent
 replay, all native wire JSON/codecs/current-state references and sequence values
 against a uniquely named disposable PostgreSQL database. It requires a schema-only
-dump of the actual initialized schema94 and drops only its own test database.
+dump of the actual initialized schema95 and drops only its own test database.
 `rooms/tests/native_http.py` tests native v12 room creation, message send/fetch and
 new state authorization in a migrated local v12 room. It enforces loopback access
 and a configured empty federation whitelist. Those staging-only events and

@@ -1,4 +1,4 @@
-"""Transactional offline import for Synapse 1.162/schema94 only.
+"""Transactional offline import for Synapse 1.165/schema95 only.
 
 Every native PDU was parsed and its reference ID checked by plan.py. Cached
 auth/state events are outliers; source timeline positions remain unchanged.

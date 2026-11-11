@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/koljasagorski/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/koljasagorski/matrix-workers/actions/workflows/security.yml)
 
-Production runs on **Debian 13 at `nbg.patchletter.com`**, using Synapse 1.162.0, PostgreSQL 17 and Caddy. The homeserver URL and account identities remain **https://m.sgr.ski**. The stack lives in `/opt/matrix`, separately from the existing Patchletter services. Cloudflare continues to manage DNS.
+Production runs on **Debian 13 at `nbg.patchletter.com`**, using Synapse 1.165.0, PostgreSQL 17 and Caddy. The homeserver URL and account identities remain **https://m.sgr.ski**. The stack lives in `/opt/matrix`, separately from the existing Patchletter services. Cloudflare continues to manage DNS.
 
 In Element Desktop, Element X or another Matrix client, keep the existing account and homeserver URL. Existing devices, sessions, public device keys, cross-signing, encrypted recovery backups, settings and `mxc://m.sgr.ski/...` media URLs are preserved. Native Synapse handles new room events, sync, receipts and federation. Registration is closed; native administration endpoints are private to the operator.
 

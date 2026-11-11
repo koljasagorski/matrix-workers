@@ -17,7 +17,7 @@ def native_token(secret: bytes, hashed_token: str, kind: str = "access") -> str:
         raise ValueError("Invalid compatibility token parameters")
     digest = hmac.new(secret, f"matrix-workers:{kind}:{hashed_token}".encode(), hashlib.sha256).digest()
     if kind == "refresh":
-        # Synapse 1.162 checks this envelope/CRC before looking up a refresh
+        # Synapse 1.165 checks this envelope/CRC before looking up a refresh
         # token. Use hex for the HMAC so underscores cannot split its fields.
         base = "syr_bXdjb21wYXQ_" + digest.hex()
         number = zlib.crc32(base.encode("ascii"))

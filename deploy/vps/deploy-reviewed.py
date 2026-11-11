@@ -25,7 +25,7 @@ BASE = Path("/opt/matrix")
 STATE = Path("/var/lib/matrix-deploy")
 GATE = BASE / "compat/maintenance.flag"
 CODE_PATHS = ("docker-compose.yml", "modules/migration_auth", "compat/auth/migration_auth", "compat/archive/archive.py", "compat/venv")
-# Official Synapse 1.162 multiwriter generators. Native startup checks new
+# Official Synapse 1.165 multiwriter generators. Native startup checks new
 # generators too; this gate explicitly covers all current table/position pairs.
 STREAMS = {
     "events": ("events_stream_seq", [("events", "stream_ordering", ">0"), ("current_state_delta_stream", "stream_id", ">0"), ("ex_outlier_stream", "event_stream_ordering", ">0")]),

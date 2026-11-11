@@ -38,7 +38,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
                 self.destination = destination
         self.not_retrying = NotRetryingDestination
         synapse = types.ModuleType("synapse")
-        synapse.__version__ = "1.162.0"
+        synapse.__version__ = "1.165.0"
         retryutils = types.ModuleType("synapse.util.retryutils")
         retryutils.NotRetryingDestination = self.not_retrying
         self.patch = patch.dict(sys.modules, {"synapse": synapse, "synapse.util.retryutils": retryutils})
@@ -78,7 +78,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.http.put_json("other.example", "/_matrix/federation/v1/send/new"), {"ok": True})
 
     async def test_version_and_missing_scope_fail_at_startup(self):
-        sys.modules["synapse"].__version__ = "1.163.0"
+        sys.modules["synapse"].__version__ = "1.162.0"
         with self.assertRaises(RuntimeError):
             self.install()
         with self.assertRaises(ValueError):

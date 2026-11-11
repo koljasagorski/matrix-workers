@@ -1,4 +1,4 @@
-The bridge is pinned to the official Synapse 1.162.0 module API and schema94. It
+The bridge is pinned to the official Synapse 1.165.0 module API and schema95. It
 preserves existing full user IDs, device IDs, passwords, signed public keys,
 encrypted secret-storage account data, backup versions, backup ciphertext and
 pending device messages. It never exports decrypted room keys.
@@ -146,12 +146,12 @@ blocked. Key, state and join requests and other destinations remain available.
 The replay daemon sends the exact old transaction IDs/bodies in their original
 order and commits a valid HTTP200 acknowledgement before marking them complete.
 This narrowly scoped wrapper uses a private Synapse transport interface and
-therefore checks the exact 1.162.0 version at startup. An explicit empty
+therefore checks the exact 1.165.0 version at startup. An explicit empty
 `destinations: []` disables the gate for an isolated startup rehearsal. Remove it
 only after replay
 is complete and before changing the pinned native version.
 
-References: [password-provider callbacks](https://github.com/element-hq/synapse/blob/v1.162.0/docs/modules/password_auth_provider_callbacks.md),
-[module API](https://github.com/element-hq/synapse/blob/v1.162.0/synapse/module_api/__init__.py),
-[native registration storage](https://github.com/element-hq/synapse/blob/v1.162.0/synapse/storage/databases/main/registration.py),
-[native E2EE storage](https://github.com/element-hq/synapse/blob/v1.162.0/synapse/storage/databases/main/end_to_end_keys.py).
+References: [password-provider callbacks](https://github.com/element-hq/synapse/blob/v1.165.0/docs/modules/password_auth_provider_callbacks.md),
+[module API](https://github.com/element-hq/synapse/blob/v1.165.0/synapse/module_api/__init__.py),
+[native registration storage](https://github.com/element-hq/synapse/blob/v1.165.0/synapse/storage/databases/main/registration.py),
+[native E2EE storage](https://github.com/element-hq/synapse/blob/v1.165.0/synapse/storage/databases/main/end_to_end_keys.py).

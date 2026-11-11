@@ -11,6 +11,8 @@ import { buildReplayPlan } from './migration/prepare-federation-replay.mjs';
 const KV = ['SESSIONS', 'DEVICE_KEYS', 'CACHE', 'CROSS_SIGNING_KEYS', 'ACCOUNT_DATA', 'ONE_TIME_KEYS'];
 const DO = ['ROOMS', 'SYNC', 'FEDERATION', 'CALL_ROOMS', 'ADMIN', 'USER_KEYS', 'PUSH', 'RATE_LIMIT'];
 const hashFile = async file => { const hash = createHash('sha256'); for await (const chunk of createReadStream(file)) hash.update(chunk); return hash.digest('hex'); };
+// Synapse versions whose import manifests are accepted: the pinned 1.165.0 and the 1.162.0 of the already completed import.
+const REVIEWED_IMPORT_VERSIONS = new Set(['1.162.0', '1.165.0']);
 const json = async file => JSON.parse(await readFile(file, 'utf8'));
 
 export async function verifyMigration({ directory, mode = 'backup', userManifest, roomManifest, proofFile } = {}) {
@@ -99,7 +101,8 @@ export async function verifyMigration({ directory, mode = 'backup', userManifest
     const users = await json(userManifest ?? join(directory, 'user-import.json'));
     const rooms = await json(roomManifest ?? join(directory, 'room-import.json'));
     required(users.complete === true && users.source_sha256 === sourceHash && rooms.source_sha256 === sourceHash, 'Final import manifests must bind the same complete source snapshot');
-    required(users.synapse_version === '1.162.0' && rooms.synapse_version === '1.162.0', 'Import manifests target an unreviewed Synapse version');
+    // Importers now write 1.165.0; manifests from the completed 1.162.0 import (schema94, upgraded in place by native startup) stay valid.
+    required(REVIEWED_IMPORT_VERSIONS.has(users.synapse_version) && REVIEWED_IMPORT_VERSIONS.has(rooms.synapse_version), 'Import manifests target an unreviewed Synapse version');
     required(users.counts?.users === sourceCounts.users && rooms.rooms === sourceCounts.rooms && rooms.source_events === sourceCounts.events, 'Import source counts mismatch');
     for (const [field, file] of [['user_keys', 'user-keys.json'], ['refresh_tokens', 'refresh-tokens.json'], ['client_filters', 'client-filters.json']]) {
       required(users.overlay_sha256?.[field] === await hashFile(join(directory, file)), `Imported ${field} overlay checksum mismatch or absent`);

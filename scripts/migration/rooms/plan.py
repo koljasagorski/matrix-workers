@@ -11,8 +11,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-SYNAPSE_VERSION = "1.162.0"
-SCHEMA_VERSION = 94
+SYNAPSE_VERSION = "1.165.0"
+SCHEMA_VERSION = 95
 
 
 def json_text(value):

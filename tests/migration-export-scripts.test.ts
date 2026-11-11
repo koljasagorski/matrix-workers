@@ -155,14 +155,18 @@ it('requires an exact final federation plan plus native ordering and durable-ser
   }
   const sourceHash = hash(await readFile(join(directory, 'source.sqlite')));
   const overlays = Object.fromEntries(await Promise.all([['user_keys', 'user-keys.json'], ['refresh_tokens', 'refresh-tokens.json'], ['client_filters', 'client-filters.json']].map(async ([field, file]) => [field, hash(await readFile(join(directory, file)))])));
-  await save('user-import.json', { complete: true, synapse_version: '1.162.0', source_sha256: sourceHash, counts: { users: counts.users }, overlay_sha256: overlays });
-  await save('room-import.json', { synapse_version: '1.162.0', source_sha256: sourceHash, rooms: counts.rooms, source_events: counts.events });
+  await save('user-import.json', { complete: true, synapse_version: '1.165.0', source_sha256: sourceHash, counts: { users: counts.users }, overlay_sha256: overlays });
+  await save('room-import.json', { synapse_version: '1.165.0', source_sha256: sourceHash, rooms: counts.rooms, source_events: counts.events });
   const proof: Record<string, unknown> = { source_sha256: sourceHash, server_name: 'm.sgr.ski' };
   for (const field of ['consistent_frozen_snapshot', 'server_signing_keys_verified', 'e2ee_recovery_verified', 'sessions_verified', 'media_verified', 'federation_queue_reconciled', 'workflows_reconciled', 'rollback_backup_restored', 'all_expected_data_reconciled']) proof[field] = true;
   await save('cutover-proof.json', proof);
   const plan = buildReplayPlan(state, { sourceSha256: sourceHash, stateSha256: hash(await readFile(join(directory, 'do-state.json'))) });
   await save('federation-replay-plan.json', plan);
-  await expect(verifyMigration({ directory, mode: 'cutover' })).rejects.toThrow('native ordering gate');
+  // Manifests of the completed 1.162.0 import stay acceptable; an unknown version does not.
+  for (const [version, message] of [['1.162.0', 'native ordering gate'], ['1.163.0', 'unreviewed Synapse version'], ['1.165.0', 'native ordering gate']]) {
+    await save('room-import.json', { synapse_version: version, source_sha256: sourceHash, rooms: counts.rooms, source_events: counts.events });
+    await expect(verifyMigration({ directory, mode: 'cutover' })).rejects.toThrow(message);
+  }
   proof.native_federation_replay_gate_verified = true; proof.federation_replay_service_verified = true;
   await save('cutover-proof.json', proof);
   expect((await verifyMigration({ directory, mode: 'cutover' })).verified).toBe(true);

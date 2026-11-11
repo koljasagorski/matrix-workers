@@ -1,4 +1,4 @@
-"""Real schema94 rollback/idempotence/preservation regression on a disposable DB.
+"""Real schema95 rollback/idempotence/preservation regression on a disposable DB.
 
 Never imports into synapse. Creates one uniquely named isolated test database,
 loads the provided schema-only dump, and drops only that created DB in finally.
@@ -16,7 +16,7 @@ import psycopg2
 from psycopg2 import sql
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from rooms.plan import build_plan, source_connection
+from rooms.plan import SCHEMA_VERSION, build_plan, source_connection
 from rooms.postgres import connect, import_plan
 
 
@@ -47,7 +47,7 @@ def main():
                 schema = "\n".join(line for line in Path(options.schema).read_text().splitlines() if not line.startswith("\\"))
                 cursor.execute(schema)
                 cursor.execute("SET search_path TO public")
-                cursor.execute("INSERT INTO schema_version(version,upgraded) VALUES (94,true)")
+                cursor.execute("INSERT INTO schema_version(version,upgraded) VALUES (%s,true)", (SCHEMA_VERSION,))
                 source = source_connection(options.source)
                 try:
                     for user in source.execute("SELECT user_id FROM users WHERE is_deactivated=0"):

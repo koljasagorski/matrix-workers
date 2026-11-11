@@ -26,8 +26,8 @@ class LegacyFederationGate:
     def __init__(self, config, api):
         import synapse
         from synapse.util.retryutils import NotRetryingDestination
-        if synapse.__version__ != "1.162.0":
-            raise RuntimeError("LegacyFederationGate requires the tested Synapse 1.162.0")
+        if synapse.__version__ != "1.165.0":
+            raise RuntimeError("LegacyFederationGate requires the tested Synapse 1.165.0")
         self.config = self.parse_config(config)
         self.uri = "file:" + quote(str(Path(self.config["journal"]).resolve())) + "?mode=ro"
         http = api._hs.get_federation_http_client()
