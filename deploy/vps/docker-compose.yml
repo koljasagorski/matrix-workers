@@ -19,7 +19,7 @@ services:
     security_opt:
       - no-new-privileges:true
   synapse:
-    image: ghcr.io/element-hq/synapse:v1.165.0@sha256:673b4223c81a7634fd07d832b939a58f97081cfdaae7cdd2d1664cdcf7611b62
+    image: ghcr.io/element-hq/synapse:v1.162.0@sha256:6b84a7bbac36f080b2d2e51e0289cf1b08b349598ea44a558df38d558f2c2311
     container_name: matrix-synapse
     restart: unless-stopped
     depends_on:
